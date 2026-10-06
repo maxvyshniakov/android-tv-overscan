@@ -18,7 +18,7 @@ It shrinks Android's picture inside the current HDMI output. The calibration gri
 
 ## Download and run
 
-Download and extract `android-tv-overscan-0.2.0.zip` from [Releases](https://github.com/skipstery/android-tv-overscan/releases). It contains the launcher, a signed APK, and these instructions. You need [Python 3.9 or later](https://www.python.org/downloads/).
+Download and extract `android-tv-overscan-0.2.0.zip` from [Releases](https://github.com/maxvyshniakov/android-tv-overscan/releases). It contains the launcher, a signed APK, and these instructions. You need [Python 3.9 or later](https://www.python.org/downloads/).
 
 Open a terminal in the extracted folder. On macOS or Linux:
 
