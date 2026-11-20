@@ -39,7 +39,10 @@ public final class MainActivity extends Activity {
           try {
             if (!BridgeClient.connected())
               throw new IllegalStateException(
-                  "Run android_tv_overscan.py on your computer to connect");
+                  AutoRestore.configured(MainActivity.this)
+                      ? "Restoring display control... If this persists, run"
+                          + " android_tv_overscan.py on your computer"
+                      : "Run android_tv_overscan.py on your computer to connect");
             value = BridgeClient.transact(null, true);
             if (reapplyOnResume) {
               value = BridgeClient.transact(value, true);
@@ -227,6 +230,7 @@ public final class MainActivity extends Activity {
     super.onResume();
     active = true;
     reapplyOnResume = true;
+    if (!BridgeClient.connected()) AutoRestore.schedule(this);
     handler.post(poll);
   }
 

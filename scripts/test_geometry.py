@@ -30,8 +30,19 @@ with tempfile.TemporaryDirectory(prefix="calibrator-tests-") as output:
             "-d",
             output,
             str(root / "android/src/com/skipstery/projectorcalibrator/Insets.java"),
+            str(root / "android/src/com/skipstery/projectorcalibrator/AdbConnection.java"),
             str(root / "tests/InsetsTest.java"),
+            str(root / "tests/AdbConnectionTest.java"),
         ],
         check=True,
     )
     subprocess.run([jdk("java"), "-cp", output, "InsetsTest"], check=True)
+    subprocess.run(
+        [
+            jdk("java"),
+            "-cp",
+            output,
+            "com.skipstery.projectorcalibrator.AdbConnectionTest",
+        ],
+        check=True,
+    )

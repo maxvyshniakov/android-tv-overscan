@@ -18,7 +18,7 @@ It shrinks Android's picture inside the current HDMI output. The calibration gri
 
 ## Download and run
 
-Download and extract `android-tv-overscan-0.2.0.zip` from [Releases](https://github.com/maxvyshniakov/android-tv-overscan/releases). It contains the launcher, a signed APK, and these instructions. You need [Python 3.9 or later](https://www.python.org/downloads/).
+Download and extract `android-tv-overscan-0.3.0.zip` from [Releases](https://github.com/maxvyshniakov/android-tv-overscan/releases). It contains the launcher, a signed APK, and these instructions. You need [Python 3.9 or later](https://www.python.org/downloads/).
 
 Open a terminal in the extracted folder. On macOS or Linux:
 
@@ -59,11 +59,22 @@ Every successful adjustment is saved automatically. Each edge is independent, so
 
 ## After a reboot
 
-Run the same command again. The TV app remembers the margins and the utility restores display control. You normally do not need to pair again, but wireless debugging may need to be re-enabled and its connection port can change.
+At the end of setup the utility offers **automatic restore**. Accept it and the TV app restores display control by itself after the streamer restarts, usually within a minute of boot, without a computer. It needs one extra wireless pairing code during setup, because the app gets its own ADB key, separate from your computer's.
 
-The controller stays alive after the console exits and while other TV apps are open. Opening Android TV Overscan from the TV's apps list lets you adjust again while the controller is running. Reopening the app also reapplies the saved correction if another system action reset the projection.
+With automatic restore on, the app:
 
-If the app is force-stopped, updated, or killed, rerun the utility. This version cannot restart the privileged controller by itself after a full reboot.
+- turns Wireless debugging back on after boot (Android switches it off), using the `WRITE_SECURE_SETTINGS` permission the utility grants;
+- finds the new Wireless debugging port on the streamer itself and connects to it with its paired key;
+- starts the same display controller that the utility starts, then reapplies the saved margins;
+- reconnects once a day, which restarts a controller that was killed and keeps Android from revoking the key after 7 days without use.
+
+Turn it on later with `--auto-restore`, or off with `--no-auto-restore`, which also deletes the app's key. If your TV offers **Developer options > Revoke debugging authorizations**, it revokes the app and your computer together.
+
+Wireless debugging stays enabled while automatic restore is on. Only paired keys can connect, but anyone with the app's key gets ADB shell access to the streamer, so treat the TV app like any other app that holds ADB access.
+
+Without automatic restore, run the same command again after a reboot. The TV app remembers the margins and the utility restores display control. Re-enable Wireless debugging first; its connection port changes. If the computer that connected before is now refused, Android revoked its access after 7 days without use; pair again.
+
+The controller stays alive after the console exits and while other TV apps are open. Opening Android TV Overscan from the TV's apps list lets you adjust again while the controller is running. Reopening the app also reapplies the saved correction if another system action reset the projection, and asks automatic restore to start a missing controller.
 
 ## Requirements and compatibility
 
@@ -102,6 +113,8 @@ python3 android_tv_overscan.py --serial DEVICE_SERIAL --non-interactive
 python3 android_tv_overscan.py --adb /path/to/adb --apk /path/to/android-tv-overscan.apk
 python3 android_tv_overscan.py --restart
 python3 android_tv_overscan.py --reinstall
+python3 android_tv_overscan.py --auto-restore
+python3 android_tv_overscan.py --no-auto-restore
 ```
 
 `--restart` restarts this app and its helper. `--reinstall` installs the supplied APK again and keeps preferences if its signature matches. Neither option reboots the streamer.
