@@ -7,7 +7,7 @@ from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
 output = root / "dist"
-archive_path = output / "android-tv-overscan-0.3.0.zip"
+archive_path = output / "android-tv-overscan-0.4.0.zip"
 with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
     for source, target in [
         (root / "android_tv_overscan.py", "android_tv_overscan.py"),

@@ -18,7 +18,7 @@ It shrinks Android's picture inside the current HDMI output. The calibration gri
 
 ## Download and run
 
-Download `android-tv-overscan-0.3.0.zip` from [Releases](https://github.com/maxvyshniakov/android-tv-overscan/releases). It contains the signed APK, the computer launcher, and these instructions.
+Download `android-tv-overscan-0.4.0.zip` from [Releases](https://github.com/maxvyshniakov/android-tv-overscan/releases). It contains the signed APK, the computer launcher, and these instructions.
 
 ### Option 1: On the TV without a computer (port 5555, Ethernet or Wi-Fi)
 
