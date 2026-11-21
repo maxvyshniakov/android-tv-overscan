@@ -59,13 +59,12 @@ final class AdbKey {
     return parse(encodePem(generator.generateKeyPair().getPrivate()));
   }
 
-  static AdbKey loadOrGenerate(File file) throws Exception {
+  static synchronized AdbKey loadOrGenerate(File file) throws Exception {
     if (exists(file)) return load(file);
     KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
     generator.initialize(2048);
     byte[] pem = encodePem(generator.generateKeyPair().getPrivate());
-    store(file, pem);
-    return parse(pem);
+    return store(file, pem);
   }
 
   static byte[] encodePem(PrivateKey key) {
@@ -75,22 +74,26 @@ final class AdbKey {
   }
 
   /** Validates the PEM before atomically replacing the stored key. */
-  static void store(File target, byte[] pem) throws Exception {
-    parse(pem);
-    File parent = target.getParentFile();
+  static synchronized AdbKey store(File target, byte[] pem) throws Exception {
+    AdbKey parsed = parse(pem);
+    File parent = target.getAbsoluteFile().getParentFile();
     if (parent != null && !parent.exists()) parent.mkdirs();
-    File temporary = new File(target.getPath() + ".tmp");
-    try (FileOutputStream out = new FileOutputStream(temporary)) {
-      out.write(pem);
-      out.getFD().sync();
-    }
-    if (!temporary.renameTo(target)) {
-      temporary.delete();
-      throw new IOException("Could not save the ADB key");
+    File temporary = File.createTempFile(target.getName() + "-", ".tmp", parent);
+    try {
+      try (FileOutputStream out = new FileOutputStream(temporary)) {
+        out.write(pem);
+        out.getFD().sync();
+      }
+      if (!temporary.renameTo(target)) {
+        throw new IOException("Could not save the ADB key");
+      }
+      return parsed;
+    } finally {
+      if (temporary.exists()) temporary.delete();
     }
   }
 
-  static void delete(File file) {
+  static synchronized void delete(File file) {
     if (file != null) file.delete();
   }
 
@@ -120,8 +123,10 @@ final class AdbKey {
    * {@code uint32_t len=64, uint32_t n0inv, uint32_t n[64], uint32_t rr[64], uint32_t exponent}.
    */
   static byte[] mincryptPublicKey(BigInteger modulus, BigInteger exponent) {
-    if (modulus.bitLength() != 2048)
+    if (modulus == null || modulus.bitLength() != 2048)
       throw new IllegalArgumentException("ADB keys are 2048-bit RSA");
+    if (exponent == null || exponent.signum() <= 0 || exponent.bitLength() > 32)
+      throw new IllegalArgumentException("RSA public exponent must fit in uint32_t");
     BigInteger word = BigInteger.ONE.shiftLeft(32);
     int n0inv = word.subtract(modulus.modInverse(word)).intValue();
     BigInteger r = BigInteger.ONE.shiftLeft(2048);

@@ -25,6 +25,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import javax.crypto.Cipher;
 
 public final class AdbConnectionTest {
   private static void check(boolean value, String message) {
@@ -137,6 +138,20 @@ public final class AdbConnectionTest {
       BigInteger expectedRr = BigInteger.ONE.shiftLeft(4096).mod(rsa1.getModulus());
       check(decodedRr.equals(expectedRr), "Little-endian rr[64] equals R^2 mod N");
 
+      // Validate exponent bounds in mincryptPublicKey
+      for (BigInteger badExponent :
+          new BigInteger[] {
+            BigInteger.ZERO, BigInteger.valueOf(-3), BigInteger.ONE.shiftLeft(32)
+          }) {
+        boolean rejectedExponent = false;
+        try {
+          AdbKey.mincryptPublicKey(rsa1.getModulus(), badExponent);
+        } catch (IllegalArgumentException expected) {
+          rejectedExponent = true;
+        }
+        check(rejectedExponent, "Invalid RSA exponent is rejected: " + badExponent);
+      }
+
       AdbKey.delete(keyFile);
       check(!AdbKey.exists(keyFile), "AdbKey.delete removes the key file");
     } finally {
@@ -173,14 +188,25 @@ public final class AdbConnectionTest {
 
   private static boolean verifyTokenSignature(PublicKey publicKey, byte[] token, byte[] signature)
       throws Exception {
-    byte[] digestInfo = new byte[AdbConnection.SHA1_DIGEST_INFO.length + token.length];
-    System.arraycopy(
-        AdbConnection.SHA1_DIGEST_INFO, 0, digestInfo, 0, AdbConnection.SHA1_DIGEST_INFO.length);
-    System.arraycopy(token, 0, digestInfo, AdbConnection.SHA1_DIGEST_INFO.length, token.length);
-    Signature verifier = Signature.getInstance("NONEwithRSA");
-    verifier.initVerify(publicKey);
-    verifier.update(digestInfo);
-    return verifier.verify(signature);
+    // Independent RFC 8017 SHA-1 DigestInfo DER prefix (do not reference AdbConnection constants)
+    byte[] rfc8017Sha1Prefix = {
+      0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14
+    };
+    byte[] expected = new byte[rfc8017Sha1Prefix.length + token.length];
+    System.arraycopy(rfc8017Sha1Prefix, 0, expected, 0, rfc8017Sha1Prefix.length);
+    System.arraycopy(token, 0, expected, rfc8017Sha1Prefix.length, token.length);
+    Cipher cipher = Cipher.getInstance("RSA/ECB/PKCS1Padding");
+    cipher.init(Cipher.DECRYPT_MODE, publicKey);
+    byte[] decrypted = cipher.doFinal(signature);
+    if (!Arrays.equals(expected, decrypted)) return false;
+
+    Signature doubleHashVerifier = Signature.getInstance("SHA1withRSA");
+    doubleHashVerifier.initVerify(publicKey);
+    doubleHashVerifier.update(token);
+    check(
+        !doubleHashVerifier.verify(signature),
+        "AUTH_TOKEN must not be SHA-1 hashed a second time");
+    return true;
   }
 
   private static void testLegacyAuthHandshakes() throws Exception {
@@ -341,10 +367,12 @@ public final class AdbConnectionTest {
     // 3. Unknown key with sendPublicKey=false (background job): does not send AUTH_RSAPUBLICKEY
     try (ServerSocket server = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
       int port = server.getLocalPort();
+      AtomicReference<Throwable> serverError = new AtomicReference<>();
       Thread daemon =
           new Thread(
               () -> {
                 try (Socket client = server.accept()) {
+                  client.setSoTimeout(5000);
                   InputStream in = client.getInputStream();
                   OutputStream out = client.getOutputStream();
                   AdbConnection.read(in); // CNXN
@@ -357,7 +385,12 @@ public final class AdbConnectionTest {
                       AdbConnection.encode(
                           AdbConnection.AUTH, AdbConnection.AUTH_TOKEN, 0, token2));
                   out.flush();
-                } catch (Throwable ignored) {
+                  int nextByte = in.read();
+                  check(
+                      nextByte == -1,
+                      "Client closes socket at EOF without sending AUTH_RSAPUBLICKEY");
+                } catch (Throwable t) {
+                  serverError.set(t);
                 }
               });
       daemon.start();
@@ -370,6 +403,7 @@ public final class AdbConnectionTest {
       }
       check(caughtUnauthorized, "Background mode throws UnauthorizedException without prompting");
       daemon.join(5000);
+      if (serverError.get() != null) throw new AssertionError(serverError.get());
     }
 
     // 4. Timeout waiting for user to approve Allow dialog: throws UnauthorizedException(prompted=true)
@@ -425,5 +459,113 @@ public final class AdbConnectionTest {
       caughtClosed = true;
     }
     check(caughtClosed, "Closed TCP port throws PortClosedException");
+
+    // 6. cancelHandle cancellation aborts an in-flight AUTH_RSAPUBLICKEY wait from another thread,
+    // and pre-cancelled cancelHandle aborts open immediately.
+    try (ServerSocket server = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
+      int port = server.getLocalPort();
+      CountDownLatch done = new CountDownLatch(1);
+      Thread daemon =
+          new Thread(
+              () -> {
+                try (Socket client = server.accept()) {
+                  InputStream in = client.getInputStream();
+                  OutputStream out = client.getOutputStream();
+                  AdbConnection.read(in); // CNXN
+                  out.write(
+                      AdbConnection.encode(
+                          AdbConnection.AUTH, AdbConnection.AUTH_TOKEN, 0, token1));
+                  out.flush();
+                  AdbConnection.read(in); // AUTH_SIGNATURE
+                  out.write(
+                      AdbConnection.encode(
+                          AdbConnection.AUTH, AdbConnection.AUTH_TOKEN, 0, token2));
+                  out.flush();
+                  AdbConnection.read(in); // AUTH_RSAPUBLICKEY
+                  done.await(10, TimeUnit.SECONDS);
+                } catch (Throwable ignored) {
+                }
+              });
+      daemon.start();
+      AtomicReference<Closeable> cancelHandle = new AtomicReference<>();
+      CountDownLatch awaitingLatch = new CountDownLatch(1);
+      Thread canceller =
+          new Thread(
+              () -> {
+                try {
+                  if (awaitingLatch.await(5, TimeUnit.SECONDS)) {
+                    Closeable active = cancelHandle.getAndSet(AdbConnection.CANCELLED);
+                    if (active != null) active.close();
+                  }
+                } catch (Exception ignored) {
+                }
+              });
+      canceller.start();
+      long startedMs = System.currentTimeMillis();
+      boolean abortedByCancel = false;
+      try (AdbConnection ignored =
+          AdbConnection.open(
+              port, key, true, 5000, 10_000, awaitingLatch::countDown, cancelHandle)) {
+        throw new AssertionError("Expected in-flight AUTH_RSAPUBLICKEY wait to abort on cancel");
+      } catch (IOException expected) {
+        abortedByCancel = true;
+      } finally {
+        done.countDown();
+      }
+      long elapsedMs = System.currentTimeMillis() - startedMs;
+      check(abortedByCancel, "In-flight AUTH_RSAPUBLICKEY wait aborts when cancelHandle is closed");
+      check(elapsedMs < 4000, "Cancel aborts promptly without waiting for 10s authTimeoutMs");
+      check(
+          cancelHandle.get() == AdbConnection.CANCELLED,
+          "Cancelled sentinel remains in cancelHandle");
+      canceller.join(5000);
+      daemon.join(5000);
+
+      boolean preCancelledAborted = false;
+      try (AdbConnection ignored =
+          AdbConnection.open(port, key, true, 5000, 5000, null, cancelHandle)) {
+        throw new AssertionError("Expected pre-cancelled cancelHandle to abort open()");
+      } catch (IOException expected) {
+        preCancelledAborted = true;
+      }
+      check(preCancelledAborted, "Pre-cancelled cancelHandle aborts open() before connecting");
+    }
+
+    // 7. Non-20-byte AUTH_TOKEN is rejected
+    for (int badLength : new int[] {0, 19, 21, 32}) {
+      boolean rejectedDirect = false;
+      try {
+        AdbConnection.signToken(key.privateKey, new byte[badLength]);
+      } catch (IOException expected) {
+        rejectedDirect = true;
+      }
+      check(rejectedDirect, "signToken rejects non-20-byte token of length " + badLength);
+    }
+    try (ServerSocket server = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
+      int port = server.getLocalPort();
+      Thread daemon =
+          new Thread(
+              () -> {
+                try (Socket client = server.accept()) {
+                  InputStream in = client.getInputStream();
+                  OutputStream out = client.getOutputStream();
+                  AdbConnection.read(in); // CNXN
+                  out.write(
+                      AdbConnection.encode(
+                          AdbConnection.AUTH, AdbConnection.AUTH_TOKEN, 0, new byte[16]));
+                  out.flush();
+                } catch (Throwable ignored) {
+                }
+              });
+      daemon.start();
+      boolean rejectedWireToken = false;
+      try (AdbConnection ignored = AdbConnection.open(port, key, false, 5000)) {
+        throw new AssertionError("Expected non-20-byte AUTH_TOKEN from server to be rejected");
+      } catch (IOException expected) {
+        rejectedWireToken = !(expected instanceof AdbConnection.PortClosedException);
+      }
+      check(rejectedWireToken, "Handshake rejects non-20-byte AUTH_TOKEN from server");
+      daemon.join(5000);
+    }
   }
 }

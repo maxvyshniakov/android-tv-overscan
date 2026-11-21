@@ -40,6 +40,7 @@ public final class MainActivity extends Activity {
   private Insets value = Insets.full(1920, 1080);
   private boolean original = false, active = false, reapplyOnResume = true;
   private volatile boolean destroyed = false, connecting = false;
+  private volatile boolean wirelessFallbackTriggered = false, awaitingManualRetry = false;
   private volatile long nextAuthAttemptMs = 0;
   private volatile SetupState setupState = SetupState.CHECKING;
   private volatile String setupDetail = null;
@@ -48,6 +49,14 @@ public final class MainActivity extends Activity {
   private Button preview;
   private CalibrationGrid grid;
   private ProfileStore profiles;
+  private final Runnable authGraceTimeout =
+      () -> {
+        if (!destroyed && connecting && setupState == SetupState.AWAITING_AUTH) {
+          awaitingManualRetry = true;
+          cancelInFlightConnection();
+          updateSetupState(SetupState.AUTH_NOT_COMPLETED, null);
+        }
+      };
   private final Runnable poll =
       new Runnable() {
         @Override
@@ -58,6 +67,8 @@ public final class MainActivity extends Activity {
               renderSetupStatus();
               connectLocalAdb();
             } else {
+              handler.removeCallbacks(authGraceTimeout);
+              cancelInFlightConnection();
               value = BridgeClient.transact(null, true);
               if (reapplyOnResume) {
                 value = BridgeClient.transact(value, true);
@@ -69,7 +80,10 @@ public final class MainActivity extends Activity {
           } catch (Exception error) {
             showError(error);
           }
-          handler.postDelayed(this, 1000);
+          if (active && !destroyed) {
+            handler.removeCallbacks(this);
+            handler.postDelayed(this, 1000);
+          }
         }
       };
 
@@ -180,7 +194,7 @@ public final class MainActivity extends Activity {
           }
         });
     rows[3].setNextFocusDownId(done.getId());
-    status = label("Run android_tv_overscan.py on your computer to connect", 12);
+    status = label("Checking local ADB on port 5555...", 12);
     status.setPadding(0, dp(7), 0, 0);
     panel.addView(status);
     setContentView(root);
@@ -196,9 +210,7 @@ public final class MainActivity extends Activity {
   private boolean apply(boolean save) {
     if (!BridgeClient.connected()) {
       original = false;
-      nextAuthAttemptMs = 0;
-      renderSetupStatus();
-      connectLocalAdb();
+      retryLocalAdb();
       return false;
     }
     boolean success = false;
@@ -216,10 +228,27 @@ public final class MainActivity extends Activity {
     return success;
   }
 
+  private void retryLocalAdb() {
+    awaitingManualRetry = false;
+    nextAuthAttemptMs = 0;
+    if (!connecting) {
+      setupState = SetupState.CHECKING;
+      setupDetail = null;
+    }
+    renderSetupStatus();
+    connectLocalAdb();
+  }
+
+  private void cancelInFlightConnection() {
+    AutoRestore.cancel(inFlightConnection);
+  }
+
   private void connectLocalAdb() {
-    if (connecting || destroyed || BridgeClient.connected()) return;
+    if (connecting || destroyed || awaitingManualRetry || BridgeClient.connected()) return;
     if (System.currentTimeMillis() < nextAuthAttemptMs) return;
     connecting = true;
+    inFlightConnection.set(null);
+    AutoRestore.registerInteractive(inFlightConnection);
     new Thread(
             () -> {
               try {
@@ -228,28 +257,49 @@ public final class MainActivity extends Activity {
                         getApplicationContext(),
                         60_000,
                         () -> updateSetupState(SetupState.AWAITING_AUTH, null),
-                        () -> updateSetupState(SetupState.STARTING, null),
+                        () -> {
+                          handler.removeCallbacks(authGraceTimeout);
+                          updateSetupState(SetupState.STARTING, null);
+                        },
                         inFlightConnection);
-                if (!result.ok) {
+                if (!result.ok && !destroyed && !BridgeClient.connected()) {
                   nextAuthAttemptMs = System.currentTimeMillis() + 4000;
                   updateSetupState(SetupState.FAILED, result.message);
                 }
               } catch (AdbConnection.PortClosedException closed) {
-                if (AutoRestore.configured(MainActivity.this)) {
-                  AutoRestore.runSoon(MainActivity.this);
+                if (!destroyed && !BridgeClient.connected()) {
+                  nextAuthAttemptMs = System.currentTimeMillis() + 3000;
+                  if (!wirelessFallbackTriggered && AutoRestore.configured(MainActivity.this)) {
+                    wirelessFallbackTriggered = true;
+                    AutoRestore.runSoon(MainActivity.this, false);
+                  }
+                  updateSetupState(SetupState.PORT_CLOSED, null);
                 }
-                updateSetupState(SetupState.PORT_CLOSED, null);
               } catch (AdbConnection.UnauthorizedException unauthorized) {
-                nextAuthAttemptMs = System.currentTimeMillis() + 4000;
-                updateSetupState(SetupState.AUTH_NOT_COMPLETED, null);
-              } catch (Exception error) {
-                if (!destroyed) {
+                if (!destroyed && !BridgeClient.connected()) {
+                  if (unauthorized.prompted) awaitingManualRetry = true;
                   nextAuthAttemptMs = System.currentTimeMillis() + 4000;
-                  updateSetupState(SetupState.FAILED, message(error));
+                  updateSetupState(SetupState.AUTH_NOT_COMPLETED, null);
+                }
+              } catch (Exception error) {
+                if (!destroyed && !BridgeClient.connected()) {
+                  if (inFlightConnection.get() == AdbConnection.CANCELLED
+                      && setupState == SetupState.AUTH_NOT_COMPLETED) {
+                    // Cancelled by authGraceTimeout after dialog dismissal; keep AUTH_NOT_COMPLETED.
+                  } else if (inFlightConnection.get() == AdbConnection.CANCELLED
+                      && !AutoRestore.configured(MainActivity.this)) {
+                    nextAuthAttemptMs = System.currentTimeMillis() + 4000;
+                  } else {
+                    nextAuthAttemptMs = System.currentTimeMillis() + 4000;
+                    updateSetupState(SetupState.FAILED, message(error));
+                  }
                 }
               } finally {
                 connecting = false;
-                if (!destroyed) handler.post(poll);
+                if (!destroyed) {
+                  handler.removeCallbacks(poll);
+                  handler.post(poll);
+                }
               }
             },
             "android-tv-overscan-setup")
@@ -296,7 +346,8 @@ public final class MainActivity extends Activity {
         dimensions.setText("Waiting for USB debugging authorization");
         status.setText(
             "Select \"Always allow from this computer\" and Allow on the TV prompt.\n"
-                + "If no prompt appears, toggle USB debugging off and on in Developer options.");
+                + "Press OK on your remote to try again, or toggle USB debugging in Developer"
+                + " options.");
         break;
       case STARTING:
         dimensions.setText("Starting display control...");
@@ -356,8 +407,16 @@ public final class MainActivity extends Activity {
     super.onResume();
     active = true;
     reapplyOnResume = true;
-    if (!connecting) nextAuthAttemptMs = 0;
+    wirelessFallbackTriggered = false;
+    if (!connecting) {
+      awaitingManualRetry = false;
+      nextAuthAttemptMs = 0;
+    } else if (setupState == SetupState.AWAITING_AUTH) {
+      handler.removeCallbacks(authGraceTimeout);
+      handler.postDelayed(authGraceTimeout, 2500);
+    }
     if (!BridgeClient.connected()) AutoRestore.schedule(this);
+    handler.removeCallbacks(poll);
     handler.post(poll);
   }
 
@@ -371,6 +430,7 @@ public final class MainActivity extends Activity {
     }
     active = false;
     handler.removeCallbacks(poll);
+    handler.removeCallbacks(authGraceTimeout);
     super.onPause();
   }
 
@@ -378,25 +438,28 @@ public final class MainActivity extends Activity {
   protected void onDestroy() {
     destroyed = true;
     handler.removeCallbacksAndMessages(null);
-    Closeable connection = inFlightConnection.getAndSet(null);
-    if (connection != null) {
-      try {
-        connection.close();
-      } catch (IOException ignored) {
-      }
-    }
+    cancelInFlightConnection();
+    AutoRestore.unregisterInteractive(inFlightConnection);
     super.onDestroy();
   }
 
   @Override
   public boolean dispatchKeyEvent(KeyEvent event) {
-    if (panel.getVisibility() != View.VISIBLE && event.getAction() == KeyEvent.ACTION_DOWN) {
+    if (event.getAction() == KeyEvent.ACTION_DOWN) {
       int key = event.getKeyCode();
-      if (key == KeyEvent.KEYCODE_BACK
-          || key == KeyEvent.KEYCODE_DPAD_CENTER
-          || key == KeyEvent.KEYCODE_ENTER) {
-        panel.setVisibility(View.VISIBLE);
-        rows[0].requestFocus();
+      if (panel.getVisibility() != View.VISIBLE) {
+        if (key == KeyEvent.KEYCODE_BACK
+            || key == KeyEvent.KEYCODE_DPAD_CENTER
+            || key == KeyEvent.KEYCODE_ENTER) {
+          panel.setVisibility(View.VISIBLE);
+          rows[0].requestFocus();
+          return true;
+        }
+      } else if (!BridgeClient.connected()
+          && !connecting
+          && (key == KeyEvent.KEYCODE_DPAD_CENTER || key == KeyEvent.KEYCODE_ENTER)
+          && !(getCurrentFocus() instanceof Button)) {
+        retryLocalAdb();
         return true;
       }
     }

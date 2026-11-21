@@ -11,6 +11,7 @@ import android.os.Process;
 import android.provider.Settings;
 import java.io.Closeable;
 import java.io.File;
+import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.ArrayList;
@@ -33,6 +34,9 @@ final class AutoRestore {
   private static final String WIFI_SETTING = "adb_wifi_enabled";
   private static final String SERVICE_TYPE = "_adb-tls-connect._tcp";
   private static final Object LOCK = new Object();
+  private static final Object KEY_LOCK = new Object();
+  private static final AtomicReference<AtomicReference<Closeable>> INTERACTIVE_HANDLE =
+      new AtomicReference<>();
 
   static final class Result {
     final boolean ok, retry;
@@ -54,25 +58,34 @@ final class AutoRestore {
   }
 
   static boolean configured(Context context) {
-    return AdbKey.exists(keyFile(context)) && !prefs(context).getBoolean("pending_auth", false);
+    synchronized (KEY_LOCK) {
+      return AdbKey.exists(keyFile(context)) && !prefs(context).getBoolean("pending_auth", false);
+    }
   }
 
   static void storeImportedKey(Context context, byte[] pem) throws Exception {
-    AdbKey.store(keyFile(context), pem);
-    prefs(context).edit().putBoolean("pending_auth", false).apply();
+    synchronized (KEY_LOCK) {
+      AdbKey.store(keyFile(context), pem);
+      prefs(context).edit().putBoolean("pending_auth", false).apply();
+    }
   }
 
   static AdbKey loadOrGenerateKey(Context context) throws Exception {
-    File file = keyFile(context);
-    if (AdbKey.exists(file)) return AdbKey.load(file);
-    prefs(context).edit().putBoolean("pending_auth", true).apply();
-    return AdbKey.loadOrGenerate(file);
+    synchronized (KEY_LOCK) {
+      File file = keyFile(context);
+      if (AdbKey.exists(file)) return AdbKey.load(file);
+      prefs(context).edit().putBoolean("pending_auth", true).apply();
+      return AdbKey.loadOrGenerate(file);
+    }
   }
 
   static void disable(Context context) {
-    cancel(context);
-    AdbKey.delete(keyFile(context));
-    prefs(context).edit().remove("pending_auth").remove("port").putBoolean("ok", false).apply();
+    cancelInteractive();
+    synchronized (KEY_LOCK) {
+      cancel(context);
+      AdbKey.delete(keyFile(context));
+      prefs(context).edit().remove("pending_auth").remove("port").putBoolean("ok", false).apply();
+    }
   }
 
   static void schedule(Context context) {
@@ -83,14 +96,12 @@ final class AutoRestore {
     if (jobs.getPendingJob(BOOT_JOB) == null)
       jobs.schedule(
           new JobInfo.Builder(BOOT_JOB, service)
-              .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
               .setMinimumLatency(3000)
               .setBackoffCriteria(30_000, JobInfo.BACKOFF_POLICY_EXPONENTIAL)
               .build());
     if (jobs.getPendingJob(DAILY_JOB) == null)
       jobs.schedule(
           new JobInfo.Builder(DAILY_JOB, service)
-              .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
               .setPeriodic(TimeUnit.HOURS.toMillis(24), TimeUnit.HOURS.toMillis(6))
               .setPersisted(true)
               .build());
@@ -98,18 +109,50 @@ final class AutoRestore {
 
   /** Runs one restore attempt immediately, for the launcher's setup check. */
   static void runSoon(Context context) {
-    context
-        .getSystemService(JobScheduler.class)
-        .schedule(
-            new JobInfo.Builder(NOW_JOB, new ComponentName(context, AutoRestoreJob.class))
-                .setOverrideDeadline(0)
-                .build());
+    runSoon(context, true);
+  }
+
+  static void runSoon(Context context, boolean replace) {
+    JobScheduler jobs = context.getSystemService(JobScheduler.class);
+    if (!replace && jobs.getPendingJob(NOW_JOB) != null) return;
+    jobs.schedule(
+        new JobInfo.Builder(NOW_JOB, new ComponentName(context, AutoRestoreJob.class))
+            .setOverrideDeadline(0)
+            .build());
   }
 
   static void cancel(Context context) {
     JobScheduler jobs = context.getSystemService(JobScheduler.class);
     jobs.cancel(BOOT_JOB);
     jobs.cancel(DAILY_JOB);
+    jobs.cancel(NOW_JOB);
+  }
+
+  static void registerInteractive(AtomicReference<Closeable> cancelHandle) {
+    INTERACTIVE_HANDLE.set(cancelHandle);
+  }
+
+  static void unregisterInteractive(AtomicReference<Closeable> cancelHandle) {
+    INTERACTIVE_HANDLE.compareAndSet(cancelHandle, null);
+  }
+
+  static void cancelInteractive() {
+    cancel(INTERACTIVE_HANDLE.getAndSet(null));
+  }
+
+  static void cancel(AtomicReference<Closeable> cancelHandle) {
+    if (cancelHandle == null) return;
+    Closeable connection = cancelHandle.getAndSet(AdbConnection.CANCELLED);
+    if (connection != null) {
+      try {
+        connection.close();
+      } catch (IOException ignored) {
+      }
+    }
+  }
+
+  private static boolean isCancelled(AtomicReference<Closeable> cancelHandle) {
+    return cancelHandle != null && cancelHandle.get() != null;
   }
 
   /**
@@ -124,20 +167,33 @@ final class AutoRestore {
       Runnable onAuthorized,
       AtomicReference<Closeable> cancelHandle)
       throws Exception {
-    if (!listening(LEGACY_PORT)) {
-      throw new AdbConnection.PortClosedException("ADB port 5555 is not listening", null);
-    }
-    AdbKey key = loadOrGenerateKey(context);
-    try (AdbConnection adb =
-        AdbConnection.open(
-            LEGACY_PORT, key, true, 10_000, authTimeoutMs, onAwaitingAuth, cancelHandle)) {
-      if (onAuthorized != null) onAuthorized.run();
-      synchronized (LOCK) {
-        Result result = restoreWithConnection(context, adb, LEGACY_PORT);
-        recordResult(context, result);
-        if (result.ok) schedule(context);
-        return result;
+    if (cancelHandle != null) registerInteractive(cancelHandle);
+    try {
+      if (isCancelled(cancelHandle)) throw new IOException("ADB connection cancelled");
+      if (!listening(LEGACY_PORT)) {
+        if (isCancelled(cancelHandle)) throw new IOException("ADB connection cancelled");
+        throw new AdbConnection.PortClosedException("ADB port 5555 is not listening", null);
       }
+      if (isCancelled(cancelHandle)) throw new IOException("ADB connection cancelled");
+      AdbKey key = loadOrGenerateKey(context);
+      if (isCancelled(cancelHandle)) throw new IOException("ADB connection cancelled");
+      try (AdbConnection adb =
+          AdbConnection.open(
+              LEGACY_PORT, key, true, 10_000, authTimeoutMs, onAwaitingAuth, cancelHandle)) {
+        if (onAuthorized != null) onAuthorized.run();
+        synchronized (LOCK) {
+          Result result = restoreWithConnection(context, adb, LEGACY_PORT);
+          synchronized (KEY_LOCK) {
+            if (AdbKey.exists(keyFile(context))) {
+              recordResult(context, result);
+              if (result.ok) schedule(context);
+            }
+          }
+          return result;
+        }
+      }
+    } finally {
+      if (cancelHandle != null) unregisterInteractive(cancelHandle);
     }
   }
 
@@ -154,20 +210,25 @@ final class AutoRestore {
   }
 
   private static void recordResult(Context context, Result result) {
-    prefs(context)
-        .edit()
-        .putLong("time", System.currentTimeMillis())
-        .putBoolean("ok", result.ok)
-        .putString("result", result.message)
-        .apply();
+    synchronized (KEY_LOCK) {
+      if (!AdbKey.exists(keyFile(context))) return;
+      prefs(context)
+          .edit()
+          .putLong("time", System.currentTimeMillis())
+          .putBoolean("ok", result.ok)
+          .putString("result", result.message)
+          .apply();
+    }
   }
 
   private static Result attempt(Context context) {
     AdbKey key;
     try {
-      File file = keyFile(context);
-      if (!AdbKey.exists(file)) return new Result(false, false, "not configured");
-      key = AdbKey.load(file);
+      synchronized (KEY_LOCK) {
+        File file = keyFile(context);
+        if (!AdbKey.exists(file)) return new Result(false, false, "not configured");
+        key = AdbKey.load(file);
+      }
     } catch (Exception error) {
       return new Result(false, false, "stored ADB key is unusable: " + error);
     }
@@ -204,12 +265,16 @@ final class AutoRestore {
         Settings.Global.putInt(context.getContentResolver(), WIFI_SETTING, 1);
     } catch (SecurityException error) {
       boolean unauthorized = legacyError instanceof AdbConnection.UnauthorizedException;
+      boolean portClosed = legacyError instanceof AdbConnection.PortClosedException;
       return new Result(
           false,
           !unauthorized,
           unauthorized
               ? "ADB on port 5555 no longer trusts this app; open the app to re-authorize"
-              : "WRITE_SECURE_SETTINGS was not granted; rerun the utility");
+              : portClosed
+                  ? "ADB port 5555 is closed and WRITE_SECURE_SETTINGS was not granted for"
+                      + " Wireless debugging"
+                  : "WRITE_SECURE_SETTINGS was not granted; rerun the utility");
     }
     List<Integer> ports = discoverPorts(context, 30_000);
     if (ports.isEmpty()) {
@@ -246,24 +311,46 @@ final class AutoRestore {
         if (prefs(context).getInt("port", 0) == port) prefs(context).edit().remove("port").apply();
       }
     }
+    if (!(legacyError instanceof AdbConnection.UnauthorizedException) && listening(LEGACY_PORT)) {
+      try (AdbConnection adb = AdbConnection.open(LEGACY_PORT, key, false, 10_000)) {
+        return restoreWithConnection(context, adb, LEGACY_PORT);
+      } catch (Exception recheckError) {
+        legacyError = recheckError;
+      }
+    }
     String reason = String.valueOf(last);
     String lower = reason.toLowerCase(java.util.Locale.ROOT);
     boolean rejected = lower.contains("certificate") || lower.contains("accept this app's key");
+    boolean legacyPortClosed = legacyError instanceof AdbConnection.PortClosedException;
     return new Result(
         false,
-        !rejected,
+        !rejected || legacyPortClosed,
         rejected
-            ? "ADB no longer trusts this app (authorization expired?); rerun the utility: " + reason
+            ? (legacyPortClosed
+                ? "ADB port 5555 is closed and Wireless debugging did not accept this app's key: "
+                    + reason
+                : "ADB no longer trusts this app (authorization expired?); rerun the utility: "
+                    + reason)
             : "could not connect to Wireless debugging: " + reason);
   }
 
   private static Result restoreWithConnection(Context context, AdbConnection adb, int port)
       throws Exception {
-    SharedPreferences.Editor editor = prefs(context).edit().putBoolean("pending_auth", false);
-    if (port != LEGACY_PORT) editor.putInt("port", port);
-    editor.apply();
+    synchronized (KEY_LOCK) {
+      if (!AdbKey.exists(keyFile(context))) {
+        return new Result(false, false, "not configured");
+      }
+      SharedPreferences.Editor editor = prefs(context).edit().putBoolean("pending_auth", false);
+      if (port != LEGACY_PORT) editor.putInt("port", port);
+      editor.apply();
+    }
     if (BridgeClient.connected()) {
       adb.shell("true");
+      synchronized (KEY_LOCK) {
+        if (!AdbKey.exists(keyFile(context))) {
+          return new Result(false, false, "not configured");
+        }
+      }
       return new Result(true, false, "helper already running; key refreshed on port " + port);
     }
     // The launcher may be starting a helper right now; do not start a second one.
@@ -274,6 +361,11 @@ final class AutoRestore {
       String log = adb.shell("tail -n 20 " + LOG);
       return new Result(false, true, "helper did not attach:\n" + log);
     }
+    synchronized (KEY_LOCK) {
+      if (!AdbKey.exists(keyFile(context))) {
+        return new Result(false, false, "not configured");
+      }
+    }
     return new Result(true, false, "display control restored via port " + port);
   }
 
@@ -282,20 +374,22 @@ final class AutoRestore {
     if (apk == null || !apk.matches("/[A-Za-z0-9._/=+~-]+\\.apk"))
       throw new IllegalStateException("Unexpected APK path");
     int user = Process.myUid() / 100000;
-    return "CLASSPATH="
+    return ": > "
+        + LOG
+        + " && { CLASSPATH="
         + apk
         + " nohup app_process /system/bin --nice-name=android-tv-overscan-bridge "
         + Protocol.PACKAGE
         + ".ShellBridge "
         + user
-        + " > "
+        + " >> "
         + LOG
-        + " 2>&1 < /dev/null &"
+        + " 2>&1 < /dev/null & pid=$!;"
         // A legacy shell: session that closes while app_process is still starting kills it,
-        // so keep the session open until the helper reports READY (at most 15 s).
-        + " i=0; while [ $i -lt 30 ] && ! grep -q READY "
+        // so keep the session open until the helper reports READY or exits (at most 15 s).
+        + " i=0; while [ $i -lt 30 ] && kill -0 $pid 2>/dev/null && ! grep -q READY "
         + LOG
-        + "; do sleep 0.5; i=$((i+1)); done";
+        + "; do sleep 0.5; i=$((i+1)); done; }";
   }
 
   /** Finds this device's Wireless debugging port via local DNS-SD, last known port first. */
