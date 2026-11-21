@@ -1,5 +1,61 @@
-<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="320dp" android:height="180dp" android:viewportWidth="320" android:viewportHeight="180">
-    <path android:fillColor="#10141B" android:pathData="M0,0h320v180h-320z" />
-    <path android:fillColor="@android:color/transparent" android:strokeColor="#344454" android:strokeWidth="1" android:pathData="M40,0v180 M80,0v180 M120,0v180 M160,0v180 M200,0v180 M240,0v180 M280,0v180 M0,30h320 M0,60h320 M0,90h320 M0,120h320 M0,150h320" />
-    <path android:fillColor="@android:color/transparent" android:strokeColor="#8CE3C2" android:strokeWidth="5" android:pathData="M65,60V30h45 M210,30h45v30 M255,120v30h-45 M110,150H65v-30 M115,62h90v56h-90z M160,48v84 M100,90h120" />
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="320dp"
+    android:height="180dp"
+    android:viewportWidth="320"
+    android:viewportHeight="180">
+    <!-- Pure black / deep charcoal background -->
+    <path
+        android:fillColor="#0A0A0D"
+        android:pathData="M0,0h320v180h-320z" />
+    <!-- Subtle dark calibration grid -->
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#1D1F26"
+        android:strokeWidth="1"
+        android:pathData="M40,0v180 M80,0v180 M120,0v180 M160,0v180 M200,0v180 M240,0v180 M280,0v180 M0,30h320 M0,60h320 M0,90h320 M0,120h320 M0,150h320" />
+    <!-- Brushed-slate 16:9 outer cinema reference bezel -->
+    <path
+        android:fillColor="#13141A"
+        android:strokeColor="#484C59"
+        android:strokeWidth="3.5"
+        android:strokeLineJoin="round"
+        android:pathData="M50,18 H270 Q276,18 276,24 V156 Q276,162 270,162 H50 Q44,162 44,156 V24 Q44,18 50,18 Z" />
+    <!-- Inner bezel recess rim -->
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#2A2D37"
+        android:strokeWidth="1.2"
+        android:pathData="M52,23 H268 Q271,23 271,26 V154 Q271,157 268,157 H52 Q49,157 49,154 V26 Q49,23 52,23 Z" />
+    <!-- Soft warm amber glow behind calibrated frame and arrows -->
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#36F5A623"
+        android:strokeWidth="6.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M94,54 H226 Q228,54 228,56 V124 Q228,126 226,126 H94 Q92,126 92,124 V56 Q92,54 94,54 Z M62,32 L80,50 M258,32 L240,50 M62,148 L80,130 M258,148 L240,130" />
+    <!-- Warm amber calibrated inner frame -->
+    <path
+        android:fillColor="#111217"
+        android:strokeColor="#F5A623"
+        android:strokeWidth="2.4"
+        android:strokeLineJoin="round"
+        android:pathData="M94,54 H226 Q228,54 228,56 V124 Q228,126 226,126 H94 Q92,126 92,124 V56 Q92,54 94,54 Z" />
+    <!-- Crisp inner amber corner brackets -->
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#FFB84D"
+        android:strokeWidth="2.2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M99,72 V61 H110 M210,61 H221 V72 M99,108 V119 H110 M210,119 H221 V108" />
+    <!-- Four inward-pointing corner arrows -->
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#FFB84D"
+        android:strokeWidth="2.6"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M62,32 L80,50 M71,50 H80 V41 M258,32 L240,50 M249,50 H240 V41 M62,148 L80,130 M71,130 H80 V139 M258,148 L240,130 M249,130 H240 V139" />
 </vector>

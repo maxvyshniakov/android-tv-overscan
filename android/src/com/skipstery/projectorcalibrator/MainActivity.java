@@ -3,10 +3,10 @@ package com.skipstery.projectorcalibrator;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
-import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.StateListDrawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -19,11 +19,34 @@ import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import java.io.Closeable;
-import java.io.IOException;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicReference;
 
 public final class MainActivity extends Activity {
+  private static final int COLOR_PANEL_BG = Color.rgb(14, 14, 18); // #0E0E12
+  private static final int COLOR_PANEL_BORDER = Color.rgb(43, 45, 54); // #2B2D36
+  private static final int COLOR_TEXT_TITLE = Color.rgb(245, 243, 238); // #F5F3EE
+  private static final int COLOR_TEXT_MUTED = Color.rgb(168, 171, 182); // #A8ABB6
+  private static final int COLOR_TEXT_HINT = Color.rgb(122, 126, 138); // #7A7E8A
+  private static final int COLOR_TEXT_ROW = Color.rgb(220, 218, 212);
+  private static final int COLOR_TEXT_BUTTON = Color.rgb(236, 234, 228); // #ECEAE4
+  private static final int COLOR_TEXT_PRIMARY_BTN = Color.rgb(18, 12, 4); // #120C04
+  private static final int COLOR_ROW_BG = Color.rgb(23, 24, 30); // #17181E
+  private static final int COLOR_ROW_FOCUS_BG = Color.rgb(44, 32, 16); // #2C2010
+  private static final int COLOR_AMBER = Color.rgb(245, 166, 35); // #F5A623
+  private static final int COLOR_AMBER_BRIGHT = Color.rgb(255, 184, 77); // #FFB84D
+  private static final int COLOR_AMBER_FOCUS_FILL = Color.rgb(255, 209, 117); // #FFD175
+  private static final int COLOR_AMBER_FOCUS_BORDER = Color.rgb(255, 242, 209); // #FFF2D1
+  private static final int COLOR_BTN_BG = Color.rgb(27, 28, 36); // #1B1C24
+  private static final int COLOR_BTN_BORDER = Color.rgb(52, 55, 69); // #343745
+  private static final int COLOR_BTN_FOCUS_BG = Color.rgb(46, 34, 18); // #2E2212
+  private static final int COLOR_STATUS_BG = Color.rgb(22, 20, 18); // #161412
+  private static final int COLOR_STATUS_BORDER = Color.rgb(107, 74, 22); // #6B4A16
+  private static final int COLOR_STATUS_TEXT = Color.rgb(230, 216, 194);
+  private static final int COLOR_BADGE_ACTIVE_BG = Color.rgb(40, 29, 12);
+  private static final int COLOR_BADGE_PREVIEW_BG = Color.rgb(56, 38, 14);
+  private static final int COLOR_BADGE_SETUP_BG = Color.rgb(26, 24, 22);
+
   private enum SetupState {
     CHECKING,
     PORT_CLOSED,
@@ -45,7 +68,7 @@ public final class MainActivity extends Activity {
   private volatile SetupState setupState = SetupState.CHECKING;
   private volatile String setupDetail = null;
   private LinearLayout panel;
-  private TextView status, dimensions;
+  private TextView status, dimensions, badge;
   private Button preview;
   private CalibrationGrid grid;
   private ProfileStore profiles;
@@ -103,21 +126,39 @@ public final class MainActivity extends Activity {
     root.addView(grid);
     panel = new LinearLayout(this);
     panel.setOrientation(LinearLayout.VERTICAL);
-    panel.setPadding(dp(22), dp(16), dp(22), dp(16));
-    panel.setBackground(background(Color.rgb(16, 25, 35), Color.rgb(52, 70, 84)));
+    panel.setPadding(dp(22), dp(18), dp(22), dp(18));
+    panel.setBackground(roundedRect(COLOR_PANEL_BG, COLOR_PANEL_BORDER, 1, 14));
     FrameLayout.LayoutParams box =
         new FrameLayout.LayoutParams(
-            dp(490), FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER);
+            dp(510), FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER);
     root.addView(panel, box);
-    TextView title = label("Android TV Overscan", 23);
+
+    // Header row: title on left, compact status badge pill on right.
+    LinearLayout header = new LinearLayout(this);
+    header.setOrientation(LinearLayout.HORIZONTAL);
+    header.setGravity(Gravity.CENTER_VERTICAL);
+    panel.addView(
+        header,
+        new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+    TextView title = label("Android TV Overscan", 22, COLOR_TEXT_TITLE);
     title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-    panel.addView(title);
-    dimensions = label("Connecting to display...", 13);
+    header.addView(title, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+    badge = label("Setup", 11, COLOR_AMBER_BRIGHT);
+    badge.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+    badge.setPadding(dp(10), dp(3), dp(10), dp(3));
+    badge.setGravity(Gravity.CENTER);
+    styleBadge("Setup", COLOR_BADGE_SETUP_BG, COLOR_STATUS_BORDER, COLOR_AMBER_BRIGHT);
+    header.addView(badge);
+
+    dimensions = label("Connecting to display...", 13, COLOR_TEXT_MUTED);
+    dimensions.setTypeface(Typeface.MONOSPACE);
+    dimensions.setPadding(0, dp(4), 0, dp(14));
     panel.addView(dimensions);
-    dimensions.setPadding(0, 0, 0, dp(14));
+
     for (int i = 0; i < 4; i++) {
       final int edge = i;
-      TextView row = label("", 17);
+      TextView row = label("", 17, COLOR_TEXT_ROW);
       rows[i] = row;
       row.setId(View.generateViewId());
       row.setTypeface(Typeface.MONOSPACE);
@@ -125,13 +166,16 @@ public final class MainActivity extends Activity {
       row.setFocusableInTouchMode(true);
       row.setGravity(Gravity.CENTER_VERTICAL);
       row.setPadding(dp(14), 0, dp(14), 0);
-      row.setBackground(background(Color.rgb(25, 37, 50), Color.TRANSPARENT));
+      styleRow(row, false);
       row.setOnFocusChangeListener(
-          (view, focused) ->
-              row.setBackground(
-                  background(
-                      focused ? Color.rgb(37, 73, 76) : Color.rgb(25, 37, 50),
-                      focused ? Color.rgb(96, 242, 192) : Color.TRANSPARENT)));
+          (view, focused) -> {
+            styleRow(row, focused);
+            if (focused) {
+              grid.activeEdge(edge);
+            } else if (!anyRowFocused()) {
+              grid.activeEdge(-1);
+            }
+          });
       row.setOnKeyListener(
           (view, key, event) -> {
             if (key != KeyEvent.KEYCODE_DPAD_LEFT && key != KeyEvent.KEYCODE_DPAD_RIGHT)
@@ -140,26 +184,36 @@ public final class MainActivity extends Activity {
               change(value.adjust(edge, key == KeyEvent.KEYCODE_DPAD_LEFT ? -1 : 1));
             return true;
           });
-      LinearLayout.LayoutParams layout = new LinearLayout.LayoutParams(-1, dp(39));
-      layout.bottomMargin = dp(5);
+      LinearLayout.LayoutParams layout = new LinearLayout.LayoutParams(-1, dp(40));
+      layout.bottomMargin = dp(6);
       panel.addView(row, layout);
     }
     for (int i = 0; i < 4; i++) {
       rows[i].setNextFocusUpId(rows[Math.max(0, i - 1)].getId());
       if (i < 3) rows[i].setNextFocusDownId(rows[i + 1].getId());
     }
+
     LinearLayout actions = new LinearLayout(this);
     actions.setOrientation(LinearLayout.HORIZONTAL);
-    panel.addView(actions);
-    Button onlyGrid = button(actions, "Grid only");
-    onlyGrid.setOnClickListener(v -> panel.setVisibility(View.GONE));
-    preview = button(actions, "Show original");
+    LinearLayout.LayoutParams actionsLayout =
+        new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    actionsLayout.topMargin = dp(6);
+    panel.addView(actions, actionsLayout);
+
+    Button onlyGrid = button(actions, "Grid only", false, true);
+    onlyGrid.setOnClickListener(
+        v -> {
+          panel.setVisibility(View.GONE);
+          grid.activeEdge(-1);
+        });
+    preview = button(actions, "Show original", false, true);
     preview.setOnClickListener(
         v -> {
           original = !original;
           apply(false);
         });
-    Button reset = button(actions, "Reset");
+    Button reset = button(actions, "Reset", false, true);
     reset.setOnClickListener(
         v ->
             new AlertDialog.Builder(this)
@@ -169,19 +223,7 @@ public final class MainActivity extends Activity {
                 .setPositiveButton(
                     "Reset", (d, w) -> change(Insets.full(value.width, value.height)))
                 .show());
-    Button done = button(actions, "Done");
-    done.setBackgroundTintList(
-        new ColorStateList(
-            new int[][] {
-              new int[] {android.R.attr.state_focused},
-              new int[] {android.R.attr.state_pressed},
-              new int[] {}
-            },
-            new int[] {
-              Color.rgb(190, 255, 231), Color.rgb(155, 255, 219), Color.rgb(96, 242, 192)
-            }));
-    done.setTextColor(Color.rgb(9, 30, 26));
-    done.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+    Button done = button(actions, "Done", true, false);
     done.setOnClickListener(
         v -> {
           original = false;
@@ -194,11 +236,47 @@ public final class MainActivity extends Activity {
           }
         });
     rows[3].setNextFocusDownId(done.getId());
-    status = label("Checking local ADB on port 5555...", 12);
-    status.setPadding(0, dp(7), 0, 0);
-    panel.addView(status);
+
+    status = label("Checking local ADB on port 5555...", 12, COLOR_STATUS_TEXT);
+    status.setBackground(roundedRect(COLOR_STATUS_BG, COLOR_STATUS_BORDER, 1, 8));
+    status.setPadding(dp(12), dp(9), dp(12), dp(9));
+    status.setLineSpacing(dp(2), 1f);
+    LinearLayout.LayoutParams statusLayout =
+        new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    statusLayout.topMargin = dp(10);
+    panel.addView(status, statusLayout);
+
+    TextView hint = label("▲▼ Select edge  ·  ◄► Adjust 1 px", 11, COLOR_TEXT_HINT);
+    hint.setGravity(Gravity.CENTER_HORIZONTAL);
+    hint.setPadding(0, dp(10), 0, 0);
+    panel.addView(hint);
+
     setContentView(root);
     rows[0].requestFocus();
+  }
+
+  private boolean anyRowFocused() {
+    for (TextView row : rows) {
+      if (row != null && row.isFocused()) return true;
+    }
+    return false;
+  }
+
+  private void styleRow(TextView row, boolean focused) {
+    row.setBackground(
+        roundedRect(
+            focused ? COLOR_ROW_FOCUS_BG : COLOR_ROW_BG,
+            focused ? COLOR_AMBER : Color.TRANSPARENT,
+            2,
+            8));
+    row.setTextColor(focused ? Color.WHITE : COLOR_TEXT_ROW);
+  }
+
+  private void styleBadge(String text, int fill, int border, int textColor) {
+    badge.setText(text);
+    badge.setTextColor(textColor);
+    badge.setBackground(roundedRect(fill, border, 1, 999));
   }
 
   private void change(Insets next) {
@@ -318,6 +396,7 @@ public final class MainActivity extends Activity {
   }
 
   private void renderSetupStatus() {
+    styleBadge("Setup", COLOR_BADGE_SETUP_BG, COLOR_STATUS_BORDER, COLOR_AMBER_BRIGHT);
     switch (setupState) {
       case PORT_CLOSED:
         if (AutoRestore.configured(this)) {
@@ -372,6 +451,12 @@ public final class MainActivity extends Activity {
 
   private void render() {
     Insets shown = original ? Insets.full(value.width, value.height) : value;
+    if (original) {
+      styleBadge("Preview", COLOR_BADGE_PREVIEW_BG, COLOR_AMBER_BRIGHT, COLOR_AMBER_FOCUS_BORDER);
+      grid.activeEdge(-1);
+    } else {
+      styleBadge("Active", COLOR_BADGE_ACTIVE_BG, COLOR_AMBER, COLOR_AMBER_BRIGHT);
+    }
     dimensions.setText(
         "Output "
             + value.width
@@ -398,6 +483,9 @@ public final class MainActivity extends Activity {
   }
 
   private void showError(Exception error) {
+    if (!BridgeClient.connected()) {
+      styleBadge("Setup", COLOR_BADGE_SETUP_BG, COLOR_STATUS_BORDER, COLOR_AMBER_BRIGHT);
+    }
     status.setText(message(error));
     status.setVisibility(View.VISIBLE);
   }
@@ -470,32 +558,60 @@ public final class MainActivity extends Activity {
     return Math.round(number * getResources().getDisplayMetrics().density);
   }
 
-  private TextView label(String text, int size) {
+  private TextView label(String text, int size, int color) {
     TextView view = new TextView(this);
     view.setText(text);
     view.setTextSize(size);
-    view.setTextColor(Color.rgb(229, 241, 247));
+    view.setTextColor(color);
     return view;
   }
 
-  private GradientDrawable background(int fill, int stroke) {
+  private GradientDrawable roundedRect(int fill, int stroke, int strokeDp, int radiusDp) {
     GradientDrawable result = new GradientDrawable();
     result.setColor(fill);
-    result.setCornerRadius(dp(7));
-    result.setStroke(dp(1), stroke);
+    result.setCornerRadius(dp(radiusDp));
+    result.setStroke(dp(strokeDp), stroke);
     return result;
   }
 
-  private Button button(LinearLayout parent, String title) {
+  private StateListDrawable buttonDrawable(boolean primary) {
+    StateListDrawable states = new StateListDrawable();
+    GradientDrawable focused =
+        primary
+            ? roundedRect(COLOR_AMBER_FOCUS_FILL, COLOR_AMBER_FOCUS_BORDER, 2, 8)
+            : roundedRect(COLOR_BTN_FOCUS_BG, COLOR_AMBER_BRIGHT, 2, 8);
+    GradientDrawable normal =
+        primary
+            ? roundedRect(COLOR_AMBER, COLOR_AMBER, 1, 8)
+            : roundedRect(COLOR_BTN_BG, COLOR_BTN_BORDER, 1, 8);
+    states.addState(new int[] {android.R.attr.state_focused}, focused);
+    states.addState(new int[] {android.R.attr.state_pressed}, focused);
+    states.addState(new int[] {}, normal);
+    return states;
+  }
+
+  private Button button(LinearLayout parent, String title, boolean primary, boolean endGap) {
     Button button = new Button(this);
     button.setId(View.generateViewId());
     button.setText(title);
     button.setTextSize(12);
     button.setAllCaps(false);
-    button.setPadding(0, 0, 0, 0);
+    button.setSingleLine(true);
+    button.setPadding(dp(6), 0, dp(6), 0);
     button.setMinWidth(0);
     button.setMinimumWidth(0);
-    parent.addView(button, new LinearLayout.LayoutParams(0, dp(44), 1));
+    button.setStateListAnimator(null);
+    button.setElevation(0f);
+    button.setBackground(buttonDrawable(primary));
+    button.setTextColor(primary ? COLOR_TEXT_PRIMARY_BTN : COLOR_TEXT_BUTTON);
+    if (primary) button.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+    button.setOnFocusChangeListener(
+        (v, focused) -> {
+          if (focused) grid.activeEdge(-1);
+        });
+    LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, dp(42), 1);
+    if (endGap) params.rightMargin = dp(6);
+    parent.addView(button, params);
     return button;
   }
 }
