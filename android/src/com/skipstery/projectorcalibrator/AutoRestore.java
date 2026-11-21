@@ -9,6 +9,8 @@ import android.net.nsd.NsdManager;
 import android.net.nsd.NsdServiceInfo;
 import android.os.Process;
 import android.provider.Settings;
+import java.io.Closeable;
+import java.io.File;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.ArrayList;
@@ -17,14 +19,16 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Restarts the privileged display helper without a computer. The app connects to the streamer's
- * own adbd through Wireless debugging with a key paired once by the launcher, and runs the same
- * helper command as android_tv_overscan.py.
+ * Restarts the privileged display helper without a computer. Tries legacy ADB on {@code
+ * 127.0.0.1:5555} first (which works computer-free and over Ethernet once approved on the TV), and
+ * falls back to Wireless debugging over TLS when port 5555 is unavailable or not authorized.
  */
 final class AutoRestore {
   static final int BOOT_JOB = 41, DAILY_JOB = 42, NOW_JOB = 43;
+  static final int LEGACY_PORT = 5555;
   static final String LOG = "/data/local/tmp/android-tv-overscan-bridge.log";
   private static final String WIFI_SETTING = "adb_wifi_enabled";
   private static final String SERVICE_TYPE = "_adb-tls-connect._tcp";
@@ -45,8 +49,30 @@ final class AutoRestore {
     return context.getSharedPreferences("auto_restore", Context.MODE_PRIVATE);
   }
 
+  static File keyFile(Context context) {
+    return new File(context.getNoBackupFilesDir(), "adbkey");
+  }
+
   static boolean configured(Context context) {
-    return AdbKey.exists(context);
+    return AdbKey.exists(keyFile(context)) && !prefs(context).getBoolean("pending_auth", false);
+  }
+
+  static void storeImportedKey(Context context, byte[] pem) throws Exception {
+    AdbKey.store(keyFile(context), pem);
+    prefs(context).edit().putBoolean("pending_auth", false).apply();
+  }
+
+  static AdbKey loadOrGenerateKey(Context context) throws Exception {
+    File file = keyFile(context);
+    if (AdbKey.exists(file)) return AdbKey.load(file);
+    prefs(context).edit().putBoolean("pending_auth", true).apply();
+    return AdbKey.loadOrGenerate(file);
+  }
+
+  static void disable(Context context) {
+    cancel(context);
+    AdbKey.delete(keyFile(context));
+    prefs(context).edit().remove("pending_auth").remove("port").putBoolean("ok", false).apply();
   }
 
   static void schedule(Context context) {
@@ -56,11 +82,11 @@ final class AutoRestore {
     // Rescheduling a running job would stop it, so leave a pending restore alone.
     if (jobs.getPendingJob(BOOT_JOB) == null)
       jobs.schedule(
-        new JobInfo.Builder(BOOT_JOB, service)
-            .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
-            .setMinimumLatency(3000)
-            .setBackoffCriteria(30_000, JobInfo.BACKOFF_POLICY_EXPONENTIAL)
-            .build());
+          new JobInfo.Builder(BOOT_JOB, service)
+              .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+              .setMinimumLatency(3000)
+              .setBackoffCriteria(30_000, JobInfo.BACKOFF_POLICY_EXPONENTIAL)
+              .build());
     if (jobs.getPendingJob(DAILY_JOB) == null)
       jobs.schedule(
           new JobInfo.Builder(DAILY_JOB, service)
@@ -87,40 +113,115 @@ final class AutoRestore {
   }
 
   /**
+   * Connects to local legacy ADB on port 5555 from the foreground UI, sending {@code
+   * AUTH_RSAPUBLICKEY} so the TV displays the "Allow USB debugging?" dialog when needed, and
+   * starts the display helper once authorized.
+   */
+  static Result connectLegacyInteractive(
+      Context context,
+      int authTimeoutMs,
+      Runnable onAwaitingAuth,
+      Runnable onAuthorized,
+      AtomicReference<Closeable> cancelHandle)
+      throws Exception {
+    if (!listening(LEGACY_PORT)) {
+      throw new AdbConnection.PortClosedException("ADB port 5555 is not listening", null);
+    }
+    AdbKey key = loadOrGenerateKey(context);
+    try (AdbConnection adb =
+        AdbConnection.open(
+            LEGACY_PORT, key, true, 10_000, authTimeoutMs, onAwaitingAuth, cancelHandle)) {
+      if (onAuthorized != null) onAuthorized.run();
+      synchronized (LOCK) {
+        Result result = restoreWithConnection(context, adb, LEGACY_PORT);
+        recordResult(context, result);
+        if (result.ok) schedule(context);
+        return result;
+      }
+    }
+  }
+
+  /**
    * Ensures the helper runs. A successful connection also refreshes adbd's last-use time for
    * this key, so Android's ADB authorization timeout does not revoke it while the TV stays on.
    */
   static Result run(Context context) {
     synchronized (LOCK) {
       Result result = attempt(context);
-      prefs(context)
-          .edit()
-          .putLong("time", System.currentTimeMillis())
-          .putBoolean("ok", result.ok)
-          .putString("result", result.message)
-          .apply();
+      recordResult(context, result);
       return result;
     }
+  }
+
+  private static void recordResult(Context context, Result result) {
+    prefs(context)
+        .edit()
+        .putLong("time", System.currentTimeMillis())
+        .putBoolean("ok", result.ok)
+        .putString("result", result.message)
+        .apply();
   }
 
   private static Result attempt(Context context) {
     AdbKey key;
     try {
-      if (!configured(context)) return new Result(false, false, "not configured");
-      key = AdbKey.load(context);
+      File file = keyFile(context);
+      if (!AdbKey.exists(file)) return new Result(false, false, "not configured");
+      key = AdbKey.load(file);
     } catch (Exception error) {
       return new Result(false, false, "stored ADB key is unusable: " + error);
+    }
+    Exception legacyError = null;
+    for (int i = 0; i < 3; i++) {
+      if (i > 0) {
+        try {
+          Thread.sleep(1500);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          break;
+        }
+      }
+      try (AdbConnection adb = AdbConnection.open(LEGACY_PORT, key, false, 10_000)) {
+        return restoreWithConnection(context, adb, LEGACY_PORT);
+      } catch (AdbConnection.PortClosedException | AdbConnection.UnauthorizedException fastFail) {
+        legacyError = fastFail;
+        break;
+      } catch (Exception error) {
+        legacyError = error;
+      }
+    }
+    if (prefs(context).getBoolean("pending_auth", false)) {
+      boolean unauthorized = legacyError instanceof AdbConnection.UnauthorizedException;
+      return new Result(
+          false,
+          !unauthorized,
+          unauthorized
+              ? "USB debugging authorization is required on the TV"
+              : "could not connect to local ADB on port 5555: " + legacyError);
     }
     try {
       if (Settings.Global.getInt(context.getContentResolver(), WIFI_SETTING, 0) != 1)
         Settings.Global.putInt(context.getContentResolver(), WIFI_SETTING, 1);
     } catch (SecurityException error) {
-      return new Result(false, false, "WRITE_SECURE_SETTINGS was not granted; rerun the utility");
+      boolean unauthorized = legacyError instanceof AdbConnection.UnauthorizedException;
+      return new Result(
+          false,
+          !unauthorized,
+          unauthorized
+              ? "ADB on port 5555 no longer trusts this app; open the app to re-authorize"
+              : "WRITE_SECURE_SETTINGS was not granted; rerun the utility");
     }
     List<Integer> ports = discoverPorts(context, 30_000);
-    if (ports.isEmpty())
+    if (ports.isEmpty()) {
+      if (!(legacyError instanceof AdbConnection.UnauthorizedException) && listening(LEGACY_PORT)) {
+        try (AdbConnection adb = AdbConnection.open(LEGACY_PORT, key, false, 10_000)) {
+          return restoreWithConnection(context, adb, LEGACY_PORT);
+        } catch (Exception ignored) {
+        }
+      }
       return new Result(
           false, true, "Wireless debugging did not start; check Wi-Fi and Developer options");
+    }
     Exception last = null;
     List<Integer> attempts = new ArrayList<>();
     // adbd occasionally drops a fresh TLS session (seen right after pairing): try each port 3 times.
@@ -139,20 +240,7 @@ final class AutoRestore {
         }
       }
       try (AdbConnection adb = AdbConnection.open(port, key.privateKey, key.certificate, 10_000)) {
-        prefs(context).edit().putInt("port", port).apply();
-        if (BridgeClient.connected()) {
-          adb.shell("true");
-          return new Result(true, false, "helper already running; key refreshed on port " + port);
-        }
-        // The launcher may be starting a helper right now; do not start a second one.
-        if (adb.shell("pidof android-tv-overscan-bridge").trim().isEmpty())
-          adb.shell(helperCommand(context));
-        for (int i = 0; i < 30 && !BridgeClient.connected(); i++) Thread.sleep(500);
-        if (!BridgeClient.connected()) {
-          String log = adb.shell("tail -n 20 " + LOG);
-          return new Result(false, true, "helper did not attach:\n" + log);
-        }
-        return new Result(true, false, "display control restored via port " + port);
+        return restoreWithConnection(context, adb, port);
       } catch (Exception error) {
         last = error;
         if (prefs(context).getInt("port", 0) == port) prefs(context).edit().remove("port").apply();
@@ -167,6 +255,26 @@ final class AutoRestore {
         rejected
             ? "ADB no longer trusts this app (authorization expired?); rerun the utility: " + reason
             : "could not connect to Wireless debugging: " + reason);
+  }
+
+  private static Result restoreWithConnection(Context context, AdbConnection adb, int port)
+      throws Exception {
+    SharedPreferences.Editor editor = prefs(context).edit().putBoolean("pending_auth", false);
+    if (port != LEGACY_PORT) editor.putInt("port", port);
+    editor.apply();
+    if (BridgeClient.connected()) {
+      adb.shell("true");
+      return new Result(true, false, "helper already running; key refreshed on port " + port);
+    }
+    // The launcher may be starting a helper right now; do not start a second one.
+    if (adb.shell("pidof android-tv-overscan-bridge").trim().isEmpty())
+      adb.shell(helperCommand(context));
+    for (int i = 0; i < 30 && !BridgeClient.connected(); i++) Thread.sleep(500);
+    if (!BridgeClient.connected()) {
+      String log = adb.shell("tail -n 20 " + LOG);
+      return new Result(false, true, "helper did not attach:\n" + log);
+    }
+    return new Result(true, false, "display control restored via port " + port);
   }
 
   static String helperCommand(Context context) {

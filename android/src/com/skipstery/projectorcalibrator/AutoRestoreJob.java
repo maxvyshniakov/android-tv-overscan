@@ -15,7 +15,7 @@ public final class AutoRestoreJob extends JobService {
     new Thread(
             () -> {
               AutoRestore.Result result = AutoRestore.run(this);
-              if (result.ok && params.getJobId() == AutoRestore.NOW_JOB) AutoRestore.schedule(this);
+              if (result.ok) AutoRestore.schedule(this);
               boolean retry;
               synchronized (AutoRestoreJob.class) {
                 attempts = result.ok ? 0 : attempts + 1;

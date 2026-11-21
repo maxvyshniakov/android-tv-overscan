@@ -18,14 +18,31 @@ import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
+import java.io.Closeable;
+import java.io.IOException;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicReference;
 
 public final class MainActivity extends Activity {
+  private enum SetupState {
+    CHECKING,
+    PORT_CLOSED,
+    AWAITING_AUTH,
+    AUTH_NOT_COMPLETED,
+    STARTING,
+    FAILED
+  }
+
   private final Handler handler = new Handler(Looper.getMainLooper());
   private final TextView[] rows = new TextView[4];
   private final String[] names = {"Left", "Right", "Top", "Bottom"};
+  private final AtomicReference<Closeable> inFlightConnection = new AtomicReference<>();
   private Insets value = Insets.full(1920, 1080);
   private boolean original = false, active = false, reapplyOnResume = true;
+  private volatile boolean destroyed = false, connecting = false;
+  private volatile long nextAuthAttemptMs = 0;
+  private volatile SetupState setupState = SetupState.CHECKING;
+  private volatile String setupDetail = null;
   private LinearLayout panel;
   private TextView status, dimensions;
   private Button preview;
@@ -35,21 +52,20 @@ public final class MainActivity extends Activity {
       new Runnable() {
         @Override
         public void run() {
-          if (!active) return;
+          if (!active || destroyed) return;
           try {
-            if (!BridgeClient.connected())
-              throw new IllegalStateException(
-                  AutoRestore.configured(MainActivity.this)
-                      ? "Restoring display control... If this persists, run"
-                          + " android_tv_overscan.py on your computer"
-                      : "Run android_tv_overscan.py on your computer to connect");
-            value = BridgeClient.transact(null, true);
-            if (reapplyOnResume) {
-              value = BridgeClient.transact(value, true);
-              reapplyOnResume = false;
+            if (!BridgeClient.connected()) {
+              renderSetupStatus();
+              connectLocalAdb();
+            } else {
+              value = BridgeClient.transact(null, true);
+              if (reapplyOnResume) {
+                value = BridgeClient.transact(value, true);
+                reapplyOnResume = false;
+              }
+              render();
+              status.setVisibility(View.GONE);
             }
-            render();
-            status.setVisibility(View.GONE);
           } catch (Exception error) {
             showError(error);
           }
@@ -178,6 +194,13 @@ public final class MainActivity extends Activity {
   }
 
   private boolean apply(boolean save) {
+    if (!BridgeClient.connected()) {
+      original = false;
+      nextAuthAttemptMs = 0;
+      renderSetupStatus();
+      connectLocalAdb();
+      return false;
+    }
     boolean success = false;
     try {
       value = BridgeClient.transact(value, !original);
@@ -191,6 +214,109 @@ public final class MainActivity extends Activity {
     }
     render();
     return success;
+  }
+
+  private void connectLocalAdb() {
+    if (connecting || destroyed || BridgeClient.connected()) return;
+    if (System.currentTimeMillis() < nextAuthAttemptMs) return;
+    connecting = true;
+    new Thread(
+            () -> {
+              try {
+                AutoRestore.Result result =
+                    AutoRestore.connectLegacyInteractive(
+                        getApplicationContext(),
+                        60_000,
+                        () -> updateSetupState(SetupState.AWAITING_AUTH, null),
+                        () -> updateSetupState(SetupState.STARTING, null),
+                        inFlightConnection);
+                if (!result.ok) {
+                  nextAuthAttemptMs = System.currentTimeMillis() + 4000;
+                  updateSetupState(SetupState.FAILED, result.message);
+                }
+              } catch (AdbConnection.PortClosedException closed) {
+                if (AutoRestore.configured(MainActivity.this)) {
+                  AutoRestore.runSoon(MainActivity.this);
+                }
+                updateSetupState(SetupState.PORT_CLOSED, null);
+              } catch (AdbConnection.UnauthorizedException unauthorized) {
+                nextAuthAttemptMs = System.currentTimeMillis() + 4000;
+                updateSetupState(SetupState.AUTH_NOT_COMPLETED, null);
+              } catch (Exception error) {
+                if (!destroyed) {
+                  nextAuthAttemptMs = System.currentTimeMillis() + 4000;
+                  updateSetupState(SetupState.FAILED, message(error));
+                }
+              } finally {
+                connecting = false;
+                if (!destroyed) handler.post(poll);
+              }
+            },
+            "android-tv-overscan-setup")
+        .start();
+  }
+
+  private void updateSetupState(SetupState state, String detail) {
+    setupState = state;
+    setupDetail = detail;
+    if (!destroyed) {
+      handler.post(
+          () -> {
+            if (!destroyed && !BridgeClient.connected()) renderSetupStatus();
+          });
+    }
+  }
+
+  private void renderSetupStatus() {
+    switch (setupState) {
+      case PORT_CLOSED:
+        if (AutoRestore.configured(this)) {
+          dimensions.setText("Restoring display control...");
+          status.setText(
+              "Port 5555 is closed; restoring via Wireless debugging.\n"
+                  + "For computer-free setup, enable Settings > System > Developer options > USB"
+                  + " debugging.");
+        } else {
+          dimensions.setText("Setup required — enable USB debugging");
+          status.setText(
+              "Set up directly on the TV with your remote:\n"
+                  + "1. Open Settings > System > About and press Android TV OS build 7 times.\n"
+                  + "2. Open Settings > System > Developer options and enable USB debugging.\n"
+                  + "3. Return here and approve the prompt.\n"
+                  + "Or run android_tv_overscan.py on your computer.");
+        }
+        break;
+      case AWAITING_AUTH:
+        dimensions.setText("Approve USB debugging with your remote");
+        status.setText(
+            "On the \"Allow USB debugging?\" prompt, check \"Always allow from this computer\" and"
+                + " select Allow with your remote.");
+        break;
+      case AUTH_NOT_COMPLETED:
+        dimensions.setText("Waiting for USB debugging authorization");
+        status.setText(
+            "Select \"Always allow from this computer\" and Allow on the TV prompt.\n"
+                + "If no prompt appears, toggle USB debugging off and on in Developer options.");
+        break;
+      case STARTING:
+        dimensions.setText("Starting display control...");
+        status.setText("USB debugging authorized. Starting display controller...");
+        break;
+      case FAILED:
+        dimensions.setText("Could not start display control");
+        status.setText(
+            setupDetail != null
+                ? setupDetail
+                : "Check USB debugging in Developer options, or run android_tv_overscan.py on your"
+                    + " computer.");
+        break;
+      case CHECKING:
+      default:
+        dimensions.setText("Connecting to display...");
+        status.setText("Checking local ADB on port 5555...");
+        break;
+    }
+    status.setVisibility(View.VISIBLE);
   }
 
   private void render() {
@@ -230,19 +356,36 @@ public final class MainActivity extends Activity {
     super.onResume();
     active = true;
     reapplyOnResume = true;
+    if (!connecting) nextAuthAttemptMs = 0;
     if (!BridgeClient.connected()) AutoRestore.schedule(this);
     handler.post(poll);
   }
 
   @Override
   protected void onPause() {
-    if (original) {
+    // Do NOT cancel inFlightConnection here: the system "Allow USB debugging?" dialog overlays
+    // MainActivity and triggers onPause() while adbd is waiting for the user's approval.
+    if (original && BridgeClient.connected()) {
       original = false;
       apply(false);
     }
     active = false;
     handler.removeCallbacks(poll);
     super.onPause();
+  }
+
+  @Override
+  protected void onDestroy() {
+    destroyed = true;
+    handler.removeCallbacksAndMessages(null);
+    Closeable connection = inFlightConnection.getAndSet(null);
+    if (connection != null) {
+      try {
+        connection.close();
+      } catch (IOException ignored) {
+      }
+    }
+    super.onDestroy();
   }
 
   @Override

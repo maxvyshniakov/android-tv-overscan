@@ -30,25 +30,41 @@ This controller is a transient ADB shell process, not a boot service. A full reb
 
 Margins must leave at least half of each display dimension visible. Both the app model and the privileged Binder endpoint enforce the bound. Reset restores the full picture, and Show original temporarily previews it without overwriting the saved margins. Done reapplies and saves the calibrated margins, closes the activity, and returns to the TV home screen.
 
-## Automatic restore
+## On-device setup and automatic restore
 
-An ordinary app cannot obtain shell UID 2000, but adbd can start shell processes for any authorized client, including a client running on the streamer itself. Automatic restore makes the app such a client.
+An ordinary app cannot obtain shell UID 2000, but `adbd` can start shell processes for any authorized client, including a client running on the streamer itself. The app includes an ADB client (`AdbConnection` and `AdbKey`) that supports both legacy ADB on TCP port `5555` and Wireless debugging over TLS 1.3.
 
-Setup, from the launcher:
+### Primary path: computer-free setup and restore via legacy ADB on port 5555
+
+On devices where `adbd` listens on TCP port `5555` when **USB debugging** is enabled (such as Google TV Streamer, which sets `service.adb.tcp.port=5555` in `build.prop`), setup and reboot recovery require no computer, no `WRITE_SECURE_SETTINGS`, and no Wi-Fi (working on Ethernet as well):
+
+1. When `MainActivity` opens without a running controller, it checks `127.0.0.1:5555`. If the port is closed, it guides the user to enable **Developer options** and **USB debugging**.
+2. Once port `5555` is listening, `AdbKey.loadOrGenerate` loads or generates a 2048-bit RSA keypair and persists its PKCS#8 PEM in the app's no-backup files directory (`adbkey`).
+3. `AdbConnection` connects to `127.0.0.1:5555` and runs the legacy ADB `AUTH` handshake:
+   - Sends `CNXN` and receives `AUTH` (`AUTH_TOKEN`) with a 20-byte token.
+   - Signs the token with `NONEwithRSA` over the 15-byte DER SHA-1 `DigestInfo` prefix (`30 21 30 09 06 05 2b 0e 03 02 1a 05 00 04 14`) concatenated with the 20-byte token, matching `adbd`'s `RSA_sign(NID_sha1)` without double-hashing, and sends `AUTH_SIGNATURE`.
+   - If the key is already authorized, `adbd` replies with `CNXN`.
+   - If the key is not yet recognized, `adbd` sends a second `AUTH_TOKEN`. During interactive onboarding, `AdbConnection` sends `AUTH_RSAPUBLICKEY` containing the 524-byte little-endian Android `mincrypt` `RSAPublicKey` struct (`len=64`, `n0inv`, `n[64]`, `rr[64]`, `exponent`) formatted as `<base64> <identity>\0`.
+4. Sending `AUTH_RSAPUBLICKEY` causes Android TV to display the system **Allow USB debugging?** dialog over `MainActivity`. Because the dialog pauses the activity, `MainActivity` keeps the in-flight socket connection alive across `onPause()` (cancelling only in `onDestroy()`). When the user checks **Always allow** and selects **Allow** with the remote, `adbd` records the key and replies with `CNXN` on the open connection.
+
+### Fallback path: Wireless debugging (ADB over TLS) and computer launcher
+
+For devices that do not listen on port `5555`, the Python launcher pairs a dedicated key over Wireless debugging:
 
 1. `pm grant` gives the app `WRITE_SECURE_SETTINGS`, a development permission that ADB shell may grant. The app uses it only to set `adb_wifi_enabled`.
 2. A second adb server, on a free local port with a temporary `HOME`, generates a fresh RSA key and pairs it with the streamer using a new pairing code. The computer's own `~/.android/adbkey` is never used or copied.
 3. `content write` streams that private key through stdin into the shell-only provider (`openFile` on `/adbkey`, caller UID 2000). The provider validates it and stores it in the app's no-backup files directory. The temporary directory and server are removed.
 4. `autoRestoreNow` schedules an immediate attempt, and the launcher polls `autoRestoreStatus` for the result.
 
+### Runtime restore and key refresh
+
 At runtime, `AutoRestoreJob` runs after `BOOT_COMPLETED` and `MY_PACKAGE_REPLACED`, when the UI opens without a controller, and once a day:
 
-1. If Wireless debugging is off, the app turns it on. Android turns it off at boot, and enables it only on a network the user already trusted for Wireless debugging.
-2. The app browses DNS-SD `_adb-tls-connect._tcp` and keeps the ports open on `127.0.0.1`. adbd listens on all interfaces, so a port open on loopback belongs to this streamer.
-3. `AdbConnection` speaks the ADB wire protocol: `CNXN`, then `STLS` and a TLS 1.3 handshake presenting a self-signed certificate built from the paired key, then `OPEN shell:`. adbd identifies TLS clients only by the certificate's public key; an unpaired key fails with `CERTIFICATE_UNKNOWN`.
-4. If no controller process exists, the app runs the launcher's helper command. The legacy `shell:` service kills a background `app_process` if the session closes while ART is still starting, so the command keeps the session open until the helper logs `READY`.
-5. Every successful connection updates adbd's last-use time for the key. The daily job therefore stops Android's 7-day ADB authorization timeout from revoking the app while the streamer stays on.
+1. `AutoRestore` tries `127.0.0.1:5555` first with `sendPublicKey=false` (so background jobs do not pop up an unsolicited authorization dialog). Both generated keys and launcher-imported keys expose the legacy `mincrypt` public key and a self-signed X.509 certificate.
+2. If port `5555` is closed or unauthorized, `AutoRestore` falls back to Wireless debugging: it turns on `adb_wifi_enabled` if needed, browses DNS-SD `_adb-tls-connect._tcp` for ports open on `127.0.0.1`, and runs the `STLS` TLS 1.3 handshake presenting the self-signed X.509 certificate built from the stored RSA key.
+3. Once connected over either transport, if no controller process exists, the app runs the helper command. The legacy `shell:` service kills a background `app_process` if the session closes while ART is still starting, so the command keeps the session open until the helper logs `READY`.
+4. Every successful connection updates `adbd`'s last-use time for the key. The daily job therefore stops Android's 7-day ADB authorization timeout (`adb_allowed_connection_time`) from revoking either a legacy RSA key or a TLS-paired key while the streamer stays on.
 
 Work runs in a JobService rather than a thread started from a provider call: Android 14 freezes a cached app process as soon as the call returns.
 
-Trade-off: Wireless debugging stays enabled, and the app's private key is equivalent to ADB shell access. Anyone who could read the app's private storage could use it. The launcher option `--no-auto-restore` deletes the key and cancels the jobs; **Revoke debugging authorizations**, where the TV offers it, invalidates all paired keys.
+Trade-off: always-allowed legacy ADB over port `5555` is LAN-reachable (`*:5555`) for any key the user approves, and Wireless debugging stays enabled when used as the fallback. In both modes, the app's private key is equivalent to ADB shell access (`uid=2000`), so anyone who could read the app's private storage could use it. The launcher option `--no-auto-restore` deletes the key and cancels the jobs; **Revoke debugging authorizations**, where the TV offers it, invalidates all approved keys.

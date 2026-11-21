@@ -64,8 +64,7 @@ public final class BridgeProvider extends ContentProvider {
       return reply;
     }
     if ("autoRestoreDisable".equals(method)) {
-      AutoRestore.cancel(getContext());
-      AdbKey.delete(getContext());
+      AutoRestore.disable(getContext());
       reply.putBoolean("configured", false);
       return reply;
     }
@@ -117,7 +116,7 @@ public final class BridgeProvider extends ContentProvider {
                   if (pem.size() > AdbKey.MAX_PEM_BYTES)
                     throw new IOException("ADB key is too large");
                 }
-                AdbKey.store(getContext(), pem.toByteArray());
+                AutoRestore.storeImportedKey(getContext(), pem.toByteArray());
                 source.close();
               } catch (Exception error) {
                 try {
