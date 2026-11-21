@@ -2,7 +2,7 @@
 
 Fix overscan and cropped screen edges on an Android TV or Google TV box connected to a TV or projector. If the picture looks zoomed in, the screen is too big, or menus are cut off at the edges, adjust the picture to fit the screen with your TV remote.
 
-The console utility guides you through ADB setup, installs the TV app, and starts display control. Adjust the left, right, top, and bottom margins in pixels, then select **Done**. The computer can disconnect once setup finishes.
+The TV app can connect to local ADB on port 5555 directly on the streamer — with no computer and over either Ethernet or Wi-Fi — or you can use the console utility from a computer to guide you through ADB setup, install the APK, and start display control. Adjust the left, right, top, and bottom margins in pixels, then select **Done**.
 
 **Requires Android TV 14 and ADB. No root required.** Tested on Google TV Streamer with a ZEEMR Z1 Pro projector at 1920 × 1080. Other Android TV boxes are unverified.
 
@@ -18,7 +18,23 @@ It shrinks Android's picture inside the current HDMI output. The calibration gri
 
 ## Download and run
 
-Download and extract `android-tv-overscan-0.3.0.zip` from [Releases](https://github.com/maxvyshniakov/android-tv-overscan/releases). It contains the launcher, a signed APK, and these instructions. You need [Python 3.9 or later](https://www.python.org/downloads/).
+Download `android-tv-overscan-0.3.0.zip` from [Releases](https://github.com/maxvyshniakov/android-tv-overscan/releases). It contains the signed APK, the computer launcher, and these instructions.
+
+### Option 1: On the TV without a computer (port 5555, Ethernet or Wi-Fi)
+
+On streamers where `adbd` listens on local TCP port `5555` (such as Google TV Streamer):
+
+1. Install `android-tv-overscan.apk` on the TV (for example, by downloading the release on the TV).
+2. Open **Settings > System > About** and select **Android TV OS build** seven times to enable Developer options.
+3. Open **Settings > System > Developer options** and turn on **USB debugging**.
+4. Open **Android TV Overscan**. The app generates its own RSA key and connects to `127.0.0.1:5555`.
+5. When the TV shows **Allow USB debugging?**, check **Always allow from this computer** and select **Allow** with the remote.
+
+The app starts the display controller immediately and restores it automatically after reboots, including when the streamer is connected over Ethernet.
+
+### Option 2: From a computer (Python launcher and Wireless debugging fallback)
+
+If you prefer installing from a computer or your TV box only offers Wireless debugging (TLS), extract the ZIP on a computer with [Python 3.9 or later](https://www.python.org/downloads/).
 
 Open a terminal in the extracted folder. On macOS or Linux:
 
@@ -59,18 +75,15 @@ Every successful adjustment is saved automatically. Each edge is independent, so
 
 ## After a reboot
 
-At the end of setup the utility offers **automatic restore**. Accept it and the TV app restores display control by itself after the streamer restarts, usually within a minute of boot, without a computer. It needs one extra wireless pairing code during setup, because the app gets its own ADB key, separate from your computer's.
+When you approve the app on port 5555 (or enable **automatic restore** in the computer launcher), the TV app restores display control by itself after the streamer restarts, usually within a minute of boot, without a computer:
 
-With automatic restore on, the app:
+- **Legacy ADB on port 5555 (tried first):** If local port `5555` is open and authorized, the app connects to `127.0.0.1:5555` with its RSA key and starts the display controller directly. This requires no computer, no `WRITE_SECURE_SETTINGS`, and no Wi-Fi, so it works on **Ethernet** as well as Wi-Fi.
+- **Wireless debugging over TLS (fallback):** If port `5555` is closed or unauthorized and automatic restore was paired by the computer utility, the app turns Wireless debugging back on after boot using `WRITE_SECURE_SETTINGS`, discovers the local TLS port via DNS-SD, and connects with its paired key.
+- **Daily key refresh:** The app reconnects once a day, which restarts a controller that was killed and updates `adbd`'s last-use timestamp so Android does not revoke the key after 7 days without use.
 
-- turns Wireless debugging back on after boot (Android switches it off), using the `WRITE_SECURE_SETTINGS` permission the utility grants;
-- finds the new Wireless debugging port on the streamer itself and connects to it with its paired key;
-- starts the same display controller that the utility starts, then reapplies the saved margins;
-- reconnects once a day, which restarts a controller that was killed and keeps Android from revoking the key after 7 days without use.
+Turn automatic restore on from the computer utility with `--auto-restore`, or off with `--no-auto-restore`, which also deletes the app's key. If your TV offers **Developer options > Revoke debugging authorizations**, it revokes the app and any paired computers together.
 
-Turn it on later with `--auto-restore`, or off with `--no-auto-restore`, which also deletes the app's key. If your TV offers **Developer options > Revoke debugging authorizations**, it revokes the app and your computer together.
-
-Wireless debugging stays enabled while automatic restore is on. Only paired keys can connect, but anyone with the app's key gets ADB shell access to the streamer, so treat the TV app like any other app that holds ADB access.
+**Security note:** Always-allowed legacy ADB over port `5555` is reachable across your local network (`*:5555`) for any key you approve on the TV, and Wireless debugging is likewise reachable on the network while enabled. The app's private key is equivalent to ADB shell access to the streamer, so treat the TV app like any other app that holds ADB access.
 
 Without automatic restore, run the same command again after a reboot. The TV app remembers the margins and the utility restores display control. Re-enable Wireless debugging first; its connection port changes. If the computer that connected before is now refused, Android revoked its access after 7 days without use; pair again.
 

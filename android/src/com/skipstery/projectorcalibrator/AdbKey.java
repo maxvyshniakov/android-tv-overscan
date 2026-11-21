@@ -1,15 +1,17 @@
 package com.skipstery.projectorcalibrator;
 
-import android.content.Context;
-import android.util.Base64;
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.math.BigInteger;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.security.KeyFactory;
+import java.security.KeyPairGenerator;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.Signature;
@@ -18,39 +20,65 @@ import java.security.cert.X509Certificate;
 import java.security.interfaces.RSAPrivateCrtKey;
 import java.security.spec.PKCS8EncodedKeySpec;
 import java.security.spec.RSAPublicKeySpec;
-import java.io.ByteArrayInputStream;
+import java.util.Base64;
 
 /**
- * The app's own ADB client key. The launcher pairs it once from the computer and streams the
- * private key into the app through the shell-only provider. ADB over TLS identifies a client only
- * by the public key in its certificate, so a self-signed certificate is enough.
+ * The app's own 2048-bit RSA ADB client key. It can be generated on the device for legacy ADB on
+ * port 5555 or paired and imported once by the desktop launcher for Wireless debugging (TLS).
+ * Exposes both a self-signed X.509 certificate for TLS and the Android mincrypt RSAPublicKey
+ * payload for legacy AUTH_RSAPUBLICKEY.
  */
 final class AdbKey {
   static final int MAX_PEM_BYTES = 8192;
+  static final int MINCRYPT_BYTES = 524;
+  static final int MODULUS_WORDS = 64;
+  static final int MODULUS_BYTES = MODULUS_WORDS * 4;
+  static final String DEFAULT_IDENTITY = "android-tv-overscan@local";
+
   final PrivateKey privateKey;
   final X509Certificate certificate;
+  final byte[] publicKey;
 
-  private AdbKey(PrivateKey privateKey, X509Certificate certificate) {
+  private AdbKey(PrivateKey privateKey, X509Certificate certificate, byte[] publicKey) {
     this.privateKey = privateKey;
     this.certificate = certificate;
+    this.publicKey = publicKey;
   }
 
-  static File file(Context context) {
-    return new File(context.getNoBackupFilesDir(), "adbkey");
+  static boolean exists(File file) {
+    return file != null && file.isFile();
   }
 
-  static boolean exists(Context context) {
-    return file(context).isFile();
+  static AdbKey load(File file) throws Exception {
+    return parse(Files.readAllBytes(file.toPath()));
   }
 
-  static AdbKey load(Context context) throws Exception {
-    return parse(Files.readAllBytes(file(context).toPath()));
+  static AdbKey generate() throws Exception {
+    KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
+    generator.initialize(2048);
+    return parse(encodePem(generator.generateKeyPair().getPrivate()));
+  }
+
+  static AdbKey loadOrGenerate(File file) throws Exception {
+    if (exists(file)) return load(file);
+    KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
+    generator.initialize(2048);
+    byte[] pem = encodePem(generator.generateKeyPair().getPrivate());
+    store(file, pem);
+    return parse(pem);
+  }
+
+  static byte[] encodePem(PrivateKey key) {
+    String body = Base64.getMimeEncoder(64, new byte[] {'\n'}).encodeToString(key.getEncoded());
+    String pem = "-----BEGIN PRIVATE KEY-----\n" + body + "\n-----END PRIVATE KEY-----\n";
+    return pem.getBytes(StandardCharsets.US_ASCII);
   }
 
   /** Validates the PEM before atomically replacing the stored key. */
-  static void store(Context context, byte[] pem) throws Exception {
+  static void store(File target, byte[] pem) throws Exception {
     parse(pem);
-    File target = file(context);
+    File parent = target.getParentFile();
+    if (parent != null && !parent.exists()) parent.mkdirs();
     File temporary = new File(target.getPath() + ".tmp");
     try (FileOutputStream out = new FileOutputStream(temporary)) {
       out.write(pem);
@@ -62,8 +90,8 @@ final class AdbKey {
     }
   }
 
-  static void delete(Context context) {
-    file(context).delete();
+  static void delete(File file) {
+    if (file != null) file.delete();
   }
 
   static AdbKey parse(byte[] pem) throws Exception {
@@ -72,7 +100,7 @@ final class AdbKey {
     String begin = "-----BEGIN PRIVATE KEY-----", end = "-----END PRIVATE KEY-----";
     int start = text.indexOf(begin), stop = text.indexOf(end);
     if (start < 0 || stop < start) throw new IllegalArgumentException("Expected a PKCS#8 ADB key");
-    byte[] der = Base64.decode(text.substring(start + begin.length(), stop), Base64.DEFAULT);
+    byte[] der = Base64.getMimeDecoder().decode(text.substring(start + begin.length(), stop));
     KeyFactory factory = KeyFactory.getInstance("RSA");
     PrivateKey key = factory.generatePrivate(new PKCS8EncodedKeySpec(der));
     if (!(key instanceof RSAPrivateCrtKey))
@@ -82,7 +110,47 @@ final class AdbKey {
       throw new IllegalArgumentException("ADB keys are 2048-bit RSA");
     PublicKey pub =
         factory.generatePublic(new RSAPublicKeySpec(rsa.getModulus(), rsa.getPublicExponent()));
-    return new AdbKey(key, selfSigned(key, pub));
+    byte[] legacyPublicKey =
+        formatPublicKey(rsa.getModulus(), rsa.getPublicExponent(), DEFAULT_IDENTITY);
+    return new AdbKey(key, selfSigned(key, pub), legacyPublicKey);
+  }
+
+  /**
+   * Encodes an RSA public key into Android's 524-byte little-endian mincrypt RSAPublicKey struct:
+   * {@code uint32_t len=64, uint32_t n0inv, uint32_t n[64], uint32_t rr[64], uint32_t exponent}.
+   */
+  static byte[] mincryptPublicKey(BigInteger modulus, BigInteger exponent) {
+    if (modulus.bitLength() != 2048)
+      throw new IllegalArgumentException("ADB keys are 2048-bit RSA");
+    BigInteger word = BigInteger.ONE.shiftLeft(32);
+    int n0inv = word.subtract(modulus.modInverse(word)).intValue();
+    BigInteger r = BigInteger.ONE.shiftLeft(2048);
+    BigInteger rr = r.multiply(r).mod(modulus);
+    ByteBuffer buffer = ByteBuffer.allocate(MINCRYPT_BYTES).order(ByteOrder.LITTLE_ENDIAN);
+    buffer.putInt(MODULUS_WORDS);
+    buffer.putInt(n0inv);
+    buffer.put(littleEndian256(modulus));
+    buffer.put(littleEndian256(rr));
+    buffer.putInt(exponent.intValue());
+    return buffer.array();
+  }
+
+  /** Formats the mincrypt public key as {@code <base64> <identity>\0} in US-ASCII for adbd. */
+  static byte[] formatPublicKey(BigInteger modulus, BigInteger exponent, String identity) {
+    String base64 = Base64.getEncoder().encodeToString(mincryptPublicKey(modulus, exponent));
+    return (base64 + " " + identity + "\0").getBytes(StandardCharsets.US_ASCII);
+  }
+
+  private static byte[] littleEndian256(BigInteger value) {
+    byte[] big = value.toByteArray();
+    byte[] little = new byte[MODULUS_BYTES];
+    int offset = big.length > 0 && big[0] == 0 ? 1 : 0;
+    int count = big.length - offset;
+    if (count > MODULUS_BYTES) throw new IllegalArgumentException("Integer exceeds 2048 bits");
+    for (int i = 0; i < count; i++) {
+      little[i] = big[big.length - 1 - i];
+    }
+    return little;
   }
 
   // Minimal DER encoder for one self-signed X.509 v3 certificate.
