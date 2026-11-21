@@ -1,0 +1,20 @@
+# Repository facts for the shared Lanefather / Repo-Kit workflow.
+project = "android-tv-overscan"
+command = "lanefather"
+state_dir = "~/.local/state/lanefather/lanes"
+coding_standards = "AGENTS.md"
+report_doc = "docs/agents/orchestration.md"
+queue_name = "Android TV Overscan engineering queue"
+
+[checks]
+verify = ".githooks/lane-check"
+slot_env = "REPO_KIT_SLOT"
+
+[admission]
+provider = "slotfather"
+
+[tickets]
+integrated_label = true
+land_comment = true
+fixes_trailer = false
+release_comment = true

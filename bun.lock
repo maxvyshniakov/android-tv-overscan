@@ -1,0 +1,19 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "android-tv-overscan",
+      "devDependencies": {
+        "@maxvyshniakov/repo-kit": "0.8.0",
+      },
+    },
+  },
+  "packages": {
+    "@maxvyshniakov/repo-kit": ["@maxvyshniakov/repo-kit@0.8.0", "https://npm.pkg.github.com/download/@maxvyshniakov/repo-kit/0.8.0/15ab9ad8021c63fb2f28d30f3bb4efe064a931b5", { "peerDependencies": { "playwright": ">=1.50.0" }, "bin": { "repo-kit": "src/cli.mjs", "repo-kit-lane": "src/lanefather.mjs" } }, "sha512-iSCkP+7h6oyV3ng1YuQkKxvbVP5mAWc8Ew2BrTnI9wGzo2DvNrNs2NK+pe6TIIn6eZTXMBgovY6tXL5sTm59lA=="],
+
+    "playwright": ["playwright@1.65.1", "", { "dependencies": { "playwright-core": "1.65.1" }, "bin": { "playwright": "cli.js" } }, "sha512-vJ1FuoOrNwOKHUIVEvSt3jT1L+wjjDpwhwIstKtfvTh8XIG4FG4bIFuvNdMxi81LGfAhUgUZleVFaOLY4RIUUw=="],
+
+    "playwright-core": ["playwright-core@1.65.1", "", { "bin": { "playwright-core": "cli.js" } }, "sha512-hqPpz7blSMPxWVdoeE1yiBSzXsKiVOd2k+kjCvmUywD2GPO2Dd9HfcWnq9NN0GHbNZDFgZ9JfBFr+X5/BLo0qw=="],
+  }
+}

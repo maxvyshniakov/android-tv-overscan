@@ -1,0 +1,15 @@
+{
+  "name": "android-tv-overscan",
+  "private": true,
+  "scripts": {
+    "test:launcher": "python3 -m unittest discover -s tests -v",
+    "check:cli": "python3 android_tv_overscan.py --help >/dev/null",
+    "test:java": "JAVA_HOME=\"${JAVA_HOME:-$([ -d /opt/homebrew/opt/openjdk@21 ] && echo /opt/homebrew/opt/openjdk@21)}\" python3 scripts/test_geometry.py",
+    "build:apk": "JAVA_HOME=\"${JAVA_HOME:-$([ -d /opt/homebrew/opt/openjdk@21 ] && echo /opt/homebrew/opt/openjdk@21)}\" ANDROID_HOME=\"${ANDROID_HOME:-$([ -d /opt/homebrew/share/android-commandlinetools ] && echo /opt/homebrew/share/android-commandlinetools)}\" python3 build.py",
+    "check:kit": "repo-kit check",
+    "verify": "repo-kit verify"
+  },
+  "devDependencies": {
+    "@maxvyshniakov/repo-kit": "0.8.0"
+  }
+}
