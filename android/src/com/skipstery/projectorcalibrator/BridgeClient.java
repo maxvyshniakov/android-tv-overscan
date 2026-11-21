@@ -19,6 +19,7 @@ final class BridgeClient {
             if (bridge == binder) bridge = null;
           },
           0);
+      AutoRestore.cancelInteractive();
     } catch (RemoteException e) {
       bridge = null;
     }

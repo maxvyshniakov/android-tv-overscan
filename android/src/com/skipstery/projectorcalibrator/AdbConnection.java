@@ -33,6 +33,8 @@ final class AdbConnection implements AutoCloseable, Closeable {
   static final int AUTH_TOKEN = 1, AUTH_SIGNATURE = 2, AUTH_RSAPUBLICKEY = 3;
   static final int VERSION = 0x01000001, STLS_VERSION = 0x01000000, MAX_PAYLOAD = 1 << 20;
   static final int TOKEN_BYTES = 20;
+  static final int SHELL_TIMEOUT_MS = 25_000;
+  static final Closeable CANCELLED = () -> {};
   static final byte[] SHA1_DIGEST_INFO = {
     0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14
   };
@@ -125,11 +127,17 @@ final class AdbConnection implements AutoCloseable, Closeable {
       throws Exception {
     Socket raw = new Socket();
     AdbConnection connection = new AdbConnection(raw);
-    if (cancelHandle != null) cancelHandle.set(connection);
+    if (cancelHandle != null && !cancelHandle.compareAndSet(null, connection)) {
+      connection.close();
+      throw new IOException("ADB connection cancelled");
+    }
     try {
       try {
         raw.connect(new InetSocketAddress("127.0.0.1", port), timeoutMs);
       } catch (IOException error) {
+        if (cancelHandle != null && cancelHandle.get() == CANCELLED) {
+          throw new IOException("ADB connection cancelled", error);
+        }
         throw new PortClosedException("ADB port " + port + " is not listening", error);
       }
       raw.setSoTimeout(timeoutMs);
@@ -252,19 +260,33 @@ final class AdbConnection implements AutoCloseable, Closeable {
 
   /** Runs a shell command and returns its combined output, truncated to 64 KiB. */
   String shell(String command) throws IOException {
-    write(out, OPEN, LOCAL_ID, 0, ("shell:" + command + "\0").getBytes(StandardCharsets.UTF_8));
-    ByteArrayOutputStream output = new ByteArrayOutputStream();
-    while (true) {
-      Message message = read(in);
-      if (message.command == OKAY) continue;
-      if (message.command == WRTE) {
-        if (output.size() < MAX_OUTPUT)
-          output.write(message.data, 0, Math.min(message.data.length, MAX_OUTPUT - output.size()));
-        write(out, OKAY, LOCAL_ID, message.arg0, new byte[0]);
-      } else if (message.command == CLSE) {
-        return output.toString(StandardCharsets.UTF_8.name());
-      } else {
-        throw new IOException("Unexpected ADB message " + message.name());
+    Socket activeSocket = tls != null ? tls : raw;
+    int previousTimeout = activeSocket.getSoTimeout();
+    if (previousTimeout > 0 && previousTimeout < SHELL_TIMEOUT_MS) {
+      activeSocket.setSoTimeout(SHELL_TIMEOUT_MS);
+    }
+    try {
+      write(out, OPEN, LOCAL_ID, 0, ("shell:" + command + "\0").getBytes(StandardCharsets.UTF_8));
+      ByteArrayOutputStream output = new ByteArrayOutputStream();
+      while (true) {
+        Message message = read(in);
+        if (message.command == OKAY) continue;
+        if (message.command == WRTE) {
+          if (output.size() < MAX_OUTPUT)
+            output.write(
+                message.data, 0, Math.min(message.data.length, MAX_OUTPUT - output.size()));
+          write(out, OKAY, LOCAL_ID, message.arg0, new byte[0]);
+        } else if (message.command == CLSE) {
+          return output.toString(StandardCharsets.UTF_8.name());
+        } else {
+          throw new IOException("Unexpected ADB message " + message.name());
+        }
+      }
+    } finally {
+      if (previousTimeout > 0
+          && previousTimeout < SHELL_TIMEOUT_MS
+          && !activeSocket.isClosed()) {
+        activeSocket.setSoTimeout(previousTimeout);
       }
     }
   }
